@@ -171,17 +171,20 @@ function uTwistOf(str) {
   for (const t of String(str).trim().split(/\s+/).filter(Boolean)) if (t[0] === "U") u = (u + (t.includes("'") ? 2 : 1)) % 3;
   return u;
 }
-// Pseudo V distance: like buildVDist, but the goal is a pseudo V — a real V with
-// an offset applied (V . offset). Seed from the real-V states (vSeeds = indices
-// where vdist==0) transformed by each offset, then multi-source BFS. Returns a
-// distance-to-nearest-pseudo-V table for the given offset set.
-function buildPseudoVDist(vSeeds, offs) {
+// Pseudo V distance: like buildVDist, but the goal is a pseudo V — a state from
+// which [L4E alg] + [offset] solves (the offset is the LAST move, per the
+// R U R' L convention). For a real-V state v solved by alg A, the pseudo V is
+// invert(A) applied to W = (offset inverse on solved); then multi-source BFS.
+function buildPseudoVDist(vSeeds, offs, dist) {
   const pv = new Int8Array(SPACE).fill(-1);
   let frontier = [];
-  for (const vi of vSeeds) {
-    const v = unindex(vi);
-    for (const o of offs) {
-      const seed = applyMoveString(o.str, v);   // pseudo V = real V . offset
+  for (const o of offs) {
+    const W = applyMoveString(invertOffsetTokens(o), solvedState());  // O^-1 on solved
+    for (const vi of vSeeds) {
+      const A = solveMoves(unindex(vi), dist);   // an L4E alg solving this V state
+      if (!A) continue;
+      const seed = copyState(W);                 // apply invert(A): reversed, each move flipped
+      for (let k = A.length - 1; k >= 0; k--) { const mi = A[k] ^ 1; applyMove(seed, MOVE_NAMES[mi][0], MOVE_NAMES[mi].includes("'")); }
       const i = stateIndex(seed);
       if (pv[i] === -1) { pv[i] = 0; frontier.push(seed); }
     }
@@ -889,7 +892,7 @@ export default function L5ETrainer() {
     const offs = parsePseudoOffsets(pso);
     if (!offs || !vbucketsRef.current) return false;
     if (pseudoVForRef.current !== pso || !pseudoVdistRef.current) {
-      pseudoVdistRef.current = buildPseudoVDist(vbucketsRef.current[0], offs);
+      pseudoVdistRef.current = buildPseudoVDist(vbucketsRef.current[0], offs, distRef.current);
       pseudoVbucketsRef.current = buildVBuckets(distRef.current, pseudoVdistRef.current);
       pseudoVForRef.current = pso;
     }
