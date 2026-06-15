@@ -90,6 +90,44 @@ function buildDist() {
   return dist;
 }
 
+// inverse of stateIndex: decode an index back into a state
+function unindex(ix) {
+  let i = ix;
+  const cval = i % 27; i = (i - cval) / 27;
+  const flips = i % 64; const pr = (i - flips) / 64;
+  const avail = [0, 1, 2, 3, 4, 5], p = [];
+  let r = pr;
+  for (let k = 0; k < 6; k++) { const f = FACT[5 - k]; const d = Math.floor(r / f); r -= d * f; p.push(avail.splice(d, 1)[0]); }
+  const e = new Array(12);
+  for (let k = 0; k < 6; k++) { e[k * 2] = p[k]; e[k * 2 + 1] = (flips >> k) & 1; }
+  return { e, c: [Math.floor(cval / 9), Math.floor(cval / 3) % 3, cval % 3] };
+}
+// V-First goal test: >=2 of the bottom edges (DF/DL/DR) placed and centers solved
+const isVState = (s) =>
+  !s.c[0] && !s.c[1] && !s.c[2] &&
+  [3, 4, 5].reduce((g, dd) => g + (s.e[dd * 2] === dd && s.e[dd * 2 + 1] === 0 ? 1 : 0), 0) >= 2;
+// multi-source BFS: distance from every reachable state to the nearest V (max 7)
+function buildVDist(dist) {
+  const vdist = new Int8Array(SPACE).fill(-1);
+  let frontier = [];
+  for (let i = 0; i < SPACE; i++) {
+    if (dist[i] < 0) continue;
+    const s = unindex(i);
+    if (isVState(s)) { vdist[i] = 0; frontier.push(s); }
+  }
+  let d = 0;
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) for (const f of "URLB") for (const inv of [false, true]) {
+      const t = copyState(s); applyMove(t, f, inv);
+      const i = stateIndex(t);
+      if (vdist[i] === -1) { vdist[i] = d + 1; next.push(t); }
+    }
+    frontier = next; d++;
+  }
+  return vdist;
+}
+
 // randomized optimal solution: state -> solved, ties broken at random
 function solveMoves(s, dist) {
   const path = [];
@@ -522,12 +560,14 @@ function BarTriangle({ bar, onPick }) {
 
 export default function L5ETrainer() {
   const distRef = useRef(null);
+  const vdistRef = useRef(null);
   const poolsRef = useRef(null);
   const [ready, setReady] = useState(false);
 
   const [bar, setBar] = useState("DL");
   const [selected, setSelected] = useState(() => new Set(L5E_IDS));
   const [mode, setMode] = useState("drill");
+  const [vlenSel, setVlenSel] = useState(() => new Set([3, 4, 5, 6])); // target V lengths (V-First)
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [current, setCurrent] = useState(null); // {scramble, set, caseKey, render, uTwist}
@@ -535,6 +575,7 @@ export default function L5ETrainer() {
   const [elapsed, setElapsed] = useState(0);
   const [last, setLast] = useState(null);
   const [caseStats, setCaseStats] = useState({});
+  const [vfs, setVfs] = useState({});            // V-First stats, keyed by optimal V length
   const [session, setSession] = useState([]);
   const [recap, setRecap] = useState(null);
   const [expandedSet, setExpandedSet] = useState(null);
@@ -562,12 +603,20 @@ export default function L5ETrainer() {
           }
           if (d.bar) setBar(d.bar);
           if (Array.isArray(d.selected)) setSelected(new Set(d.selected.filter((id) => SET_BY_ID[id])));
+          if (["drill", "recap", "vfirst"].includes(d.mode)) setMode(d.mode);
+          if (Array.isArray(d.vlen)) setVlenSel(new Set(d.vlen.filter((n) => n >= 1 && n <= 6)));
+          if (d.vfs && typeof d.vfs === "object") {
+            const v = {};
+            for (const [k, st] of Object.entries(d.vfs)) if (/^[1-6]$/.test(k)) v[k] = st;
+            setVfs(v);
+          }
         }
       } catch (e) { /* first run */ }
       loadedStore.current = true;
       setTimeout(() => {
         if (cancelled) return;
         distRef.current = buildDist();
+        vdistRef.current = buildVDist(distRef.current);
         poolsRef.current = buildPools();
         setReady(true);
       }, 40);
@@ -581,10 +630,10 @@ export default function L5ETrainer() {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       try {
-        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected] })).catch(() => {});
+        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs })).catch(() => {});
       } catch (e) {}
     }, 400);
-  }, [caseStats, bar, selected]);
+  }, [caseStats, bar, selected, mode, vlenSel, vfs]);
 
   const makeScramble = useCallback((setId, caseKey, presArr) => {
     let physical = null, scramble = null, uTwist = 0, target = 0;
@@ -640,7 +689,49 @@ export default function L5ETrainer() {
     } else setCurrent(null);
   }, [selected, makeScramble, poolOf]);
 
+  // V-First: greedy optimal V solution (descends the V-distance table)
+  const solveToV = useCallback((s) => {
+    const vdist = vdistRef.current;
+    const path = []; let cur = copyState(s); let cd = vdist[stateIndex(cur)];
+    let guard = 0;
+    while (cd > 0 && guard++ < 20) {
+      let picked = null;
+      for (let mi = 0; mi < 8; mi++) {
+        const t = copyState(cur); applyMove(t, MOVE_NAMES[mi][0], MOVE_NAMES[mi].includes("'"));
+        if (vdist[stateIndex(t)] === cd - 1) { picked = [mi, t]; break; }
+      }
+      if (!picked) break;
+      path.push(picked[0]); cur = picked[1]; cd--;
+    }
+    return path.map((mi) => MOVE_NAMES[mi]).join(" ");
+  }, []);
+
+  // V-First: a random 8-11 move scramble whose optimal V length is in lenSet
+  const makeVScramble = useCallback((lenSet) => {
+    const vdist = vdistRef.current;
+    if (!vdist || !lenSet || lenSet.size === 0) return null;
+    for (let attempt = 0; attempt < 4000; attempt++) {
+      const k = 8 + Math.floor(Math.random() * 4);
+      const seq = []; let last = -1;
+      for (let n = 0; n < k; n++) { let mi; do { mi = Math.floor(Math.random() * 8); } while ((mi >> 1) === last); last = mi >> 1; seq.push(mi); }
+      const st = solvedState(); let uTwist = 0;
+      for (const mi of seq) {
+        const nm = MOVE_NAMES[mi];
+        applyMove(st, nm[0], nm.includes("'"));
+        if (nm[0] === "U") uTwist = (uTwist + (nm.includes("'") ? 2 : 1)) % 3;
+      }
+      const vlen = vdist[stateIndex(st)];
+      if (vlen > 0 && lenSet.has(vlen)) {
+        return { kind: "vfirst", scramble: seq.map((mi) => MOVE_NAMES[mi]).join(" "), render: st, uTwist, vlen, vsol: solveToV(st) };
+      }
+    }
+    return null;
+  }, [solveToV]);
+
+  const nextV = useCallback(() => { setCurrent(makeVScramble(vlenSel)); }, [makeVScramble, vlenSel]);
+
   const advance = useCallback(() => {
+    if (mode === "vfirst") { nextV(); return; }
     if (mode === "drill") { nextDrill(); return; }
     setRecap((r) => {
       if (!r) return r;
@@ -650,16 +741,17 @@ export default function L5ETrainer() {
       setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey)));
       return { ...r, idx };
     });
-  }, [mode, nextDrill, makeScramble, poolOf]);
+  }, [mode, nextDrill, nextV, makeScramble, poolOf]);
 
   useEffect(() => {
     if (!ready) return;
     setPhase("ready");
     setLast(null);
-    if (mode === "drill") nextDrill();
+    if (mode === "vfirst") nextV();
+    else if (mode === "drill") nextDrill();
     else startRecap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, bar, selected, mode]);
+  }, [ready, bar, selected, mode, vlenSel]);
 
   const tick = useCallback(() => {
     setElapsed(performance.now() - t0.current);
@@ -679,13 +771,24 @@ export default function L5ETrainer() {
     setElapsed(ms);
     setPhase("stopped");
     if (current) {
-      const rec = { ms, set: current.set, caseKey: current.caseKey, render: current.render, uTwist: current.uTwist };
-      setLast(rec);
-      setSession((s) => [...s.slice(-49), rec]);
-      setCaseStats((cs) => {
-        const prev = cs[current.caseKey] || { n: 0, best: Infinity, sum: 0, set: current.set };
-        return { ...cs, [current.caseKey]: { set: current.set, n: prev.n + 1, best: Math.min(prev.best, ms), sum: prev.sum + ms } };
-      });
+      if (current.kind === "vfirst") {
+        const rec = { ms, kind: "vfirst", vlen: current.vlen, scramble: current.scramble, render: current.render, uTwist: current.uTwist, vsol: current.vsol };
+        setLast(rec);
+        setSession((s) => [...s.slice(-49), rec]);
+        setVfs((v) => {
+          const key = String(current.vlen);
+          const prev = v[key] || { n: 0, best: Infinity, sum: 0 };
+          return { ...v, [key]: { n: prev.n + 1, best: Math.min(prev.best, ms), sum: prev.sum + ms } };
+        });
+      } else {
+        const rec = { ms, set: current.set, caseKey: current.caseKey, render: current.render, uTwist: current.uTwist };
+        setLast(rec);
+        setSession((s) => [...s.slice(-49), rec]);
+        setCaseStats((cs) => {
+          const prev = cs[current.caseKey] || { n: 0, best: Infinity, sum: 0, set: current.set };
+          return { ...cs, [current.caseKey]: { set: current.set, n: prev.n + 1, best: Math.min(prev.best, ms), sum: prev.sum + ms } };
+        });
+      }
     }
     advance();
   }, [current, advance]);
@@ -740,11 +843,16 @@ export default function L5ETrainer() {
 
   const recapDone = mode === "recap" && recap && recap.idx >= recap.queue.length;
 
+  const toggleVlen = (L) => {
+    setVlenSel((s) => { const n = new Set(s); if (n.has(L)) n.delete(L); else n.add(L); return n; });
+  };
+
   const resetStats = () => {
     setCaseStats({});
+    setVfs({});
     setSession([]);
     setLast(null);
-    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected] })).catch(() => {}); } catch (e) {}
+    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs: {} })).catch(() => {}); } catch (e) {}
   };
 
   return (
@@ -902,34 +1010,58 @@ export default function L5ETrainer() {
           </div>
         )}
 
-        <div className="chips">
-          <span className="grouplabel" style={{ marginLeft: 0 }}>L5E</span>
-          {SETS.filter((s) => s.group === "L5E").map((s) => (
-            <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
-              style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
-              <span className="dot" />{s.name}
-              {ready && <span className="ct">{counts[s.id]}</span>}
-            </button>
-          ))}
-          <span className="grouplabel">L4E</span>
-          {SETS.filter((s) => s.group === "L4E").map((s) => (
-            <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
-              style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
-              <span className="dot" />{s.name}
-              {ready && <span className="ct">{counts[s.id]}</span>}
-            </button>
-          ))}
-        </div>
-        <div className="presets">
-          <button className="preset" onClick={() => setSelected(new Set(L5E_IDS))}>all L5E</button>
-          <button className="preset" onClick={() => setSelected(new Set(ALL_IDS))}>everything</button>
-          <button className="preset" onClick={() => setSelected(new Set())}>none</button>
-        </div>
+        {mode !== "vfirst" && (
+          <>
+            <div className="chips">
+              <span className="grouplabel" style={{ marginLeft: 0 }}>L5E</span>
+              {SETS.filter((s) => s.group === "L5E").map((s) => (
+                <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
+                  style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
+                  <span className="dot" />{s.name}
+                  {ready && <span className="ct">{counts[s.id]}</span>}
+                </button>
+              ))}
+              <span className="grouplabel">L4E</span>
+              {SETS.filter((s) => s.group === "L4E").map((s) => (
+                <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
+                  style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
+                  <span className="dot" />{s.name}
+                  {ready && <span className="ct">{counts[s.id]}</span>}
+                </button>
+              ))}
+            </div>
+            <div className="presets">
+              <button className="preset" onClick={() => setSelected(new Set(L5E_IDS))}>all L5E</button>
+              <button className="preset" onClick={() => setSelected(new Set(ALL_IDS))}>everything</button>
+              <button className="preset" onClick={() => setSelected(new Set())}>none</button>
+            </div>
+          </>
+        )}
 
         <div className="modes">
           <button className={"mode" + (mode === "drill" ? " on" : "")} onClick={() => setMode("drill")}>Drill</button>
           <button className={"mode" + (mode === "recap" ? " on" : "")} onClick={() => setMode("recap")}>Recap</button>
+          <button className={"mode" + (mode === "vfirst" ? " on" : "")} onClick={() => setMode("vfirst")}>V-First</button>
         </div>
+
+        {mode === "vfirst" && (
+          <>
+            <div className="chips">
+              <span className="grouplabel" style={{ marginLeft: 0 }}>V length</span>
+              {[1, 2, 3, 4, 5, 6].map((L) => (
+                <button key={L} className={"chip" + (vlenSel.has(L) ? " on" : "")}
+                  style={{ "--cdot": "var(--accent)" }} onClick={() => toggleVlen(L)}>
+                  <span className="dot" />{L}
+                </button>
+              ))}
+            </div>
+            <div className="presets">
+              <button className="preset" onClick={() => setVlenSel(new Set([1, 2, 3, 4, 5, 6]))}>all</button>
+              <button className="preset" onClick={() => setVlenSel(new Set([3, 4, 5, 6]))}>typical</button>
+              <button className="preset" onClick={() => setVlenSel(new Set())}>none</button>
+            </div>
+          </>
+        )}
 
         {mode === "recap" && recap && recap.queue.length > 0 && (
           <div className="recapbar">
@@ -949,7 +1081,9 @@ export default function L5ETrainer() {
           </div>
         ) : !current ? (
           <div className="stage" style={{ cursor: "default" }}>
-            <div className="empty" style={{ padding: "40px 0", textAlign: "center" }}>Select at least one set to start.</div>
+            <div className="empty" style={{ padding: "40px 0", textAlign: "center" }}>
+              {mode === "vfirst" ? "Select at least one V length to start." : "Select at least one set to start."}
+            </div>
           </div>
         ) : (
           <div className="stage" onPointerDown={(e) => { e.preventDefault(); trigger(); }}>
@@ -959,19 +1093,29 @@ export default function L5ETrainer() {
             </div>
             <div className={"timer" + (phase === "running" ? " running" : "")}>{fmt(elapsed)}</div>
             {phase === "stopped" && last ? (
-              <div className="reveal">
-                <span>that was</span>
-                <span className="tag" style={{ "--cdot": SET_BY_ID[last.set].color }}>
-                  <span className="dot" />{SET_BY_ID[last.set].name}
-                </span>
-                {lookupName(last.render, last.uTwist, last.caseKey) ? (
-                  <span className="casename">{lookupName(last.render, last.uTwist, last.caseKey)}</span>
-                ) : null}
-                <button className="algbtn" onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => { e.stopPropagation(); setPanel({ kind: "live", ...last }); }}>
-                  view algs
-                </button>
-              </div>
+              last.kind === "vfirst" ? (
+                <div className="reveal">
+                  <span>optimal V</span>
+                  <span className="tag" style={{ "--cdot": "var(--accent)" }}>
+                    <span className="dot" />{last.vlen} {last.vlen === 1 ? "move" : "moves"}
+                  </span>
+                  {last.vsol ? <span className="mono casename">{last.vsol}</span> : null}
+                </div>
+              ) : (
+                <div className="reveal">
+                  <span>that was</span>
+                  <span className="tag" style={{ "--cdot": SET_BY_ID[last.set].color }}>
+                    <span className="dot" />{SET_BY_ID[last.set].name}
+                  </span>
+                  {lookupName(last.render, last.uTwist, last.caseKey) ? (
+                    <span className="casename">{lookupName(last.render, last.uTwist, last.caseKey)}</span>
+                  ) : null}
+                  <button className="algbtn" onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => { e.stopPropagation(); setPanel({ kind: "live", ...last }); }}>
+                    view algs
+                  </button>
+                </div>
+              )
             ) : (
               <div className="hint">{phase === "running" ? "tap or any key to stop" : "tap or space to start"}</div>
             )}
@@ -980,47 +1124,75 @@ export default function L5ETrainer() {
 
         <div className="panelrow">
           <div className="card">
-            <h3>Stats by set</h3>
-            {Object.keys(setAgg).length === 0 ? (
-              <div className="empty">No solves yet. Times land here, grouped by set.</div>
+            {mode === "vfirst" ? (
+              <>
+                <h3>V-First — by optimal length</h3>
+                {Object.keys(vfs).length === 0 ? (
+                  <div className="empty">No V-First solves yet. Times land here, by optimal V length.</div>
+                ) : (
+                  <table>
+                    <thead><tr><th>V length</th><th>Solves</th><th>Best</th><th>Mean</th></tr></thead>
+                    <tbody>
+                      {Object.keys(vfs).map(Number).sort((a, b) => a - b).map((L) => {
+                        const a = vfs[String(L)];
+                        return (
+                          <tr key={L}>
+                            <td className="name">{L} moves</td>
+                            <td className="mono">{a.n}</td>
+                            <td className="mono">{fmt(a.best)}</td>
+                            <td className="mono">{fmt(a.sum / a.n)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </>
             ) : (
-              <table>
-                <thead><tr><th>Set</th><th>Solves</th><th>Cases seen</th><th>Best</th><th>Mean</th></tr></thead>
-                <tbody>
-                  {SETS.filter((s) => setAgg[s.id]).map((s) => {
-                    const a = setAgg[s.id];
-                    return (
-                      <tr key={s.id} className="setrow" onClick={() => setExpandedSet(expandedSet === s.id ? null : s.id)}>
-                        <td className="name">
-                          <span className="dot" style={{ background: s.color }} />{s.name}
-                          <span className="chev">{expandedSet === s.id ? "▾" : "▸"}</span>
-                        </td>
-                        <td className="mono">{a.n}</td>
-                        <td className="mono">{a.cases}{counts[s.id] ? ` / ${counts[s.id]}` : ""}</td>
-                        <td className="mono">{fmt(a.best)}</td>
-                        <td className="mono">{fmt(a.sum / a.n)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-            {expandedSet && setAgg[expandedSet] && (
-              <div className="casegrid">
-                {Object.entries(caseStats)
-                  .filter(([, st]) => st.set === expandedSet)
-                  .sort((a, b) => b[1].sum / b[1].n - a[1].sum / a[1].n)
-                  .map(([ck, st]) => (
-                    <div key={ck} className="casecard click" onClick={() => setPanel({ kind: "class", caseKey: ck, set: st.set })}>
-                      <PyraminxNet state={displayState(ck, st.set, bar)} uTwist={+ck.split("|")[1]} />
-                      <div className="casenums">
-                        <span className="mono">{fmt(st.sum / st.n)}</span>
-                        <span className="casesub">{SHEET.CNAME[ck] || "unnamed"}</span>
-                        <span className="casesub">best {fmt(st.best)} · {st.n}×</span>
-                      </div>
-                    </div>
-                  ))}
-              </div>
+              <>
+                <h3>Stats by set</h3>
+                {Object.keys(setAgg).length === 0 ? (
+                  <div className="empty">No solves yet. Times land here, grouped by set.</div>
+                ) : (
+                  <table>
+                    <thead><tr><th>Set</th><th>Solves</th><th>Cases seen</th><th>Best</th><th>Mean</th></tr></thead>
+                    <tbody>
+                      {SETS.filter((s) => setAgg[s.id]).map((s) => {
+                        const a = setAgg[s.id];
+                        return (
+                          <tr key={s.id} className="setrow" onClick={() => setExpandedSet(expandedSet === s.id ? null : s.id)}>
+                            <td className="name">
+                              <span className="dot" style={{ background: s.color }} />{s.name}
+                              <span className="chev">{expandedSet === s.id ? "▾" : "▸"}</span>
+                            </td>
+                            <td className="mono">{a.n}</td>
+                            <td className="mono">{a.cases}{counts[s.id] ? ` / ${counts[s.id]}` : ""}</td>
+                            <td className="mono">{fmt(a.best)}</td>
+                            <td className="mono">{fmt(a.sum / a.n)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+                {expandedSet && setAgg[expandedSet] && (
+                  <div className="casegrid">
+                    {Object.entries(caseStats)
+                      .filter(([, st]) => st.set === expandedSet)
+                      .sort((a, b) => b[1].sum / b[1].n - a[1].sum / a[1].n)
+                      .map(([ck, st]) => (
+                        <div key={ck} className="casecard click" onClick={() => setPanel({ kind: "class", caseKey: ck, set: st.set })}>
+                          <PyraminxNet state={displayState(ck, st.set, bar)} uTwist={+ck.split("|")[1]} />
+                          <div className="casenums">
+                            <span className="mono">{fmt(st.sum / st.n)}</span>
+                            <span className="casesub">{SHEET.CNAME[ck] || "unnamed"}</span>
+                            <span className="casesub">best {fmt(st.best)} · {st.n}×</span>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </>
             )}
           </div>
           <div className="card">
@@ -1030,7 +1202,7 @@ export default function L5ETrainer() {
             ) : (
               <div className="times">
                 {session.slice(-24).map((t, i) => (
-                  <span key={i} className="timepill" style={{ "--cdot": SET_BY_ID[t.set].color }}>{fmt(t.ms)}</span>
+                  <span key={i} className="timepill" style={{ "--cdot": t.set ? SET_BY_ID[t.set].color : "var(--accent)" }}>{fmt(t.ms)}</span>
                 ))}
               </div>
             )}
