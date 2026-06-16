@@ -208,6 +208,16 @@ function buildPseudoVDist(vSeeds, offs, dist) {
   }
   return pv;
 }
+// distance to the UNION of several goal sets = elementwise min of their tables
+function combineDists(tables) {
+  const out = new Int8Array(SPACE).fill(-1);
+  for (let i = 0; i < SPACE; i++) {
+    let m = -1;
+    for (const t of tables) { const d = t[i]; if (d >= 0 && (m < 0 || d < m)) m = d; }
+    out[i] = m;
+  }
+  return out;
+}
 
 // randomized optimal solution: state -> solved, ties broken at random
 function solveMoves(s, dist) {
@@ -648,6 +658,10 @@ export default function L5ETrainer() {
   const pseudoVForRef = useRef(null);   // the offsets string the pseudo-V table was built for
   const tl4eDistRef = useRef(null);
   const tl4eBucketsRef = useRef(null);
+  const combinedDistRef = useRef(null);
+  const combinedBucketsRef = useRef(null);
+  const combinedForRef = useRef(null);   // offsets string the combined table was built for
+  const committedPso = useRef("L, R'");  // offsets the current scramble was generated with
   const poolsRef = useRef(null);
   const [ready, setReady] = useState(false);
 
@@ -665,8 +679,6 @@ export default function L5ETrainer() {
   const [vfs, setVfs] = useState({});            // Solution Trainer accuracy, keyed by solution length
   const [guessMsg, setGuessMsg] = useState("");  // Solution Trainer: transient "too low" message
   const [pso, setPso] = useState("L, R'");       // pseudo offsets, shared by Recog + Pseudo V
-  const [psStats, setPsStats] = useState({});    // Pseudo V accuracy, keyed by setup length
-  const [tl4eStats, setTl4eStats] = useState({}); // TL4E accuracy, keyed by setup length
   const [session, setSession] = useState([]);
   const [recap, setRecap] = useState(null);
   const [expandedSet, setExpandedSet] = useState(null);
@@ -694,18 +706,8 @@ export default function L5ETrainer() {
           }
           if (d.bar) setBar(d.bar);
           if (Array.isArray(d.selected)) setSelected(new Set(d.selected.filter((id) => SET_BY_ID[id])));
-          if (["drill", "recap", "solution", "recog", "pseudov", "tl4e"].includes(d.mode)) setMode(d.mode);
+          if (["drill", "recap", "solution", "recog"].includes(d.mode)) setMode(d.mode);
           if (typeof d.pso === "string") setPso(d.pso);
-          if (d.psf && typeof d.psf === "object") {
-            const v = {};
-            for (const [k, st] of Object.entries(d.psf)) if (/^[1-7]$/.test(k)) v[k] = st;
-            setPsStats(v);
-          }
-          if (d.tlf && typeof d.tlf === "object") {
-            const v = {};
-            for (const [k, st] of Object.entries(d.tlf)) if (/^[1-7]$/.test(k)) v[k] = st;
-            setTl4eStats(v);
-          }
           if (Array.isArray(d.vlen)) setVlenSel(new Set(d.vlen.filter((n) => n >= 1 && n <= 7)));
           if (d.vfs && typeof d.vfs === "object") {
             const v = {};
@@ -735,10 +737,10 @@ export default function L5ETrainer() {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       try {
-        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs, pso, psf: psStats, tlf: tl4eStats })).catch(() => {});
+        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs, pso })).catch(() => {});
       } catch (e) {}
     }, 400);
-  }, [caseStats, bar, selected, mode, vlenSel, vfs, pso, psStats, tl4eStats]);
+  }, [caseStats, bar, selected, mode, vlenSel, vfs, pso]);
 
   const makeScramble = useCallback((setId, caseKey, presArr) => {
     let physical = null, scramble = null, uTwist = 0, target = 0;
@@ -829,10 +831,33 @@ export default function L5ETrainer() {
     return null;
   }, []);
 
+  // Solution Trainer (combined): the goal is the shortest first step of ANY
+  // kind — a real V, a pseudo V (for the current offsets), or a TL4E-B. The
+  // combined distance is the elementwise min of those three tables; rebuilt
+  // when the offsets change (the pseudo-V part depends on them).
+  const ensureSolution = useCallback(() => {
+    if (!vdistRef.current || !tl4eDistRef.current) return;
+    if (combinedForRef.current === pso && combinedDistRef.current) return;
+    const tables = [vdistRef.current, tl4eDistRef.current];
+    const offs = parsePseudoOffsets(pso);
+    if (offs) {
+      if (pseudoVForRef.current !== pso || !pseudoVdistRef.current) {
+        pseudoVdistRef.current = buildPseudoVDist(vbucketsRef.current[0], offs, distRef.current);
+        pseudoVForRef.current = pso;
+      }
+      tables.push(pseudoVdistRef.current);
+    }
+    combinedDistRef.current = combineDists(tables);
+    combinedBucketsRef.current = buildVBuckets(distRef.current, combinedDistRef.current);
+    combinedForRef.current = pso;
+  }, [pso]);
+
   const nextSolution = useCallback(() => {
     setPhase("ready"); setLast(null); setGuessMsg("");
-    setCurrent(makeBucketScramble(vlenSel, vbucketsRef.current, "solution"));
-  }, [makeBucketScramble, vlenSel]);
+    committedPso.current = pso;
+    ensureSolution();
+    setCurrent(combinedBucketsRef.current ? makeBucketScramble(vlenSel, combinedBucketsRef.current, "solution") : null);
+  }, [ensureSolution, makeBucketScramble, vlenSel, pso]);
 
   // Solution Trainer: grade the picked move count.
   //   below optimal -> impossible: show an error, keep the same scramble (no reveal)
@@ -840,20 +865,17 @@ export default function L5ETrainer() {
   //   above optimal  -> a valid but non-optimal answer
   // For any answer >= optimal we reveal every optimal solution and advance.
   const submitGuess = useCallback((n) => {
-    const k = current && current.kind;
-    if (!current || (k !== "solution" && k !== "pseudov" && k !== "tl4e") || phase === "stopped") return;
+    if (!current || current.kind !== "solution" || phase === "stopped") return;
     if (n < current.vlen) {
-      setGuessMsg(`No ${k === "solution" ? "solution" : "setup"} in ${n} ${n === 1 ? "move" : "moves"} — the shortest is longer. Keep looking.`);
+      setGuessMsg(`No solution in ${n} ${n === 1 ? "move" : "moves"} — the shortest is longer. Keep looking.`);
       return;
     }
-    const table = k === "pseudov" ? pseudoVdistRef.current : k === "tl4e" ? tl4eDistRef.current : vdistRef.current;
-    const setStats = k === "pseudov" ? setPsStats : k === "tl4e" ? setTl4eStats : setVfs;
     const correct = n === current.vlen;
     setGuessMsg("");
-    setLast({ kind: k, guess: n, correct, vlen: current.vlen, render: current.render, uTwist: current.uTwist, sols: allOptimalVs(current.render, table) });
+    setLast({ kind: "solution", guess: n, correct, vlen: current.vlen, render: current.render, uTwist: current.uTwist, sols: allOptimalVs(current.render, combinedDistRef.current) });
     setPhase("stopped");
-    setSession((s) => [...s.slice(-49), { kind: k, correct, vlen: current.vlen }]);
-    setStats((v) => {
+    setSession((s) => [...s.slice(-49), { kind: "solution", correct, vlen: current.vlen }]);
+    setVfs((v) => {
       const key = String(current.vlen);
       const prev = v[key] || { n: 0, correct: 0 };
       return { ...v, [key]: { n: prev.n + 1, correct: prev.correct + (correct ? 1 : 0) } };
@@ -888,7 +910,6 @@ export default function L5ETrainer() {
     return null;
   }, [makeScramble]);
 
-  const committedPso = useRef("L, R'");
   const nextRecog = useCallback(() => {
     committedPso.current = pso;
     setPhase("ready"); setLast(null);
@@ -902,43 +923,15 @@ export default function L5ETrainer() {
     setPhase("stopped");
   }, [current]);
 
-  // regenerate the current pseudo scramble when offsets actually change (on blur)
-  // Pseudo V (Feature 2): the Solution Trainer flow, but the goal is a pseudo V
-  // (a real V with an offset applied). Build the pseudo-V distance table lazily
-  // for the current offsets, then reuse the bucket-scramble + descent helpers.
-  const ensurePseudoV = useCallback(() => {
-    const offs = parsePseudoOffsets(pso);
-    if (!offs || !vbucketsRef.current) return false;
-    if (pseudoVForRef.current !== pso || !pseudoVdistRef.current) {
-      pseudoVdistRef.current = buildPseudoVDist(vbucketsRef.current[0], offs, distRef.current);
-      pseudoVbucketsRef.current = buildVBuckets(distRef.current, pseudoVdistRef.current);
-      pseudoVForRef.current = pso;
-    }
-    return true;
-  }, [pso]);
-
-  const nextPseudoV = useCallback(() => {
-    setPhase("ready"); setLast(null); setGuessMsg("");
-    committedPso.current = pso;
-    setCurrent(ensurePseudoV() ? makeBucketScramble(vlenSel, pseudoVbucketsRef.current, "pseudov") : null);
-  }, [ensurePseudoV, makeBucketScramble, vlenSel, pso]);
-
-  // TL4E (Feature): shortest setup to a V with the back center twisted.
-  const nextTL4E = useCallback(() => {
-    setPhase("ready"); setLast(null); setGuessMsg("");
-    setCurrent(makeBucketScramble(vlenSel, tl4eBucketsRef.current, "tl4e"));
-  }, [makeBucketScramble, vlenSel]);
-
+  // regenerate the current scramble when offsets actually change (on blur)
   const commitOffsets = useCallback(() => {
     if (pso === committedPso.current) return;
-    if (mode === "recog") nextRecog();
-    else if (mode === "pseudov") nextPseudoV();
-  }, [pso, mode, nextRecog, nextPseudoV]);
+    if (mode === "solution") nextSolution();
+    else if (mode === "recog") nextRecog();
+  }, [pso, mode, nextSolution, nextRecog]);
 
   const advance = useCallback(() => {
     if (mode === "solution") { nextSolution(); return; }
-    if (mode === "pseudov") { nextPseudoV(); return; }
-    if (mode === "tl4e") { nextTL4E(); return; }
     if (mode === "recog") { nextRecog(); return; }
     if (mode === "drill") { nextDrill(); return; }
     setRecap((r) => {
@@ -949,15 +942,13 @@ export default function L5ETrainer() {
       setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey)));
       return { ...r, idx };
     });
-  }, [mode, nextDrill, nextSolution, nextPseudoV, nextTL4E, nextRecog, makeScramble, poolOf]);
+  }, [mode, nextDrill, nextSolution, nextRecog, makeScramble, poolOf]);
 
   useEffect(() => {
     if (!ready) return;
     setPhase("ready");
     setLast(null);
     if (mode === "solution") nextSolution();
-    else if (mode === "pseudov") nextPseudoV();
-    else if (mode === "tl4e") nextTL4E();
     else if (mode === "recog") nextRecog();
     else if (mode === "drill") nextDrill();
     else startRecap();
@@ -1013,9 +1004,9 @@ export default function L5ETrainer() {
         }
         return;
       }
-      if (mode === "solution" || mode === "pseudov" || mode === "tl4e") {
+      if (mode === "solution") {
         if (phase === "stopped") {
-          if (e.code === "Space" || e.code === "Enter" || e.code === "NumpadEnter") { e.preventDefault(); (mode === "pseudov" ? nextPseudoV : mode === "tl4e" ? nextTL4E : nextSolution)(); }
+          if (e.code === "Space" || e.code === "Enter" || e.code === "NumpadEnter") { e.preventDefault(); nextSolution(); }
           return;
         }
         const m = e.code.match(/^(?:Digit|Numpad)([1-7])$/);
@@ -1027,7 +1018,7 @@ export default function L5ETrainer() {
     };
     window.addEventListener("keydown", down);
     return () => window.removeEventListener("keydown", down);
-  }, [phase, trigger, stopTimer, panel, mode, submitGuess, nextSolution, nextPseudoV, nextTL4E, nextRecog, revealRecog]);
+  }, [phase, trigger, stopTimer, panel, mode, submitGuess, nextSolution, nextRecog, revealRecog]);
 
   useEffect(() => () => cancelAnimationFrame(raf.current), []);
 
@@ -1068,11 +1059,9 @@ export default function L5ETrainer() {
   const resetStats = () => {
     setCaseStats({});
     setVfs({});
-    setPsStats({});
-    setTl4eStats({});
     setSession([]);
     setLast(null);
-    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs: {}, pso, psf: {}, tlf: {} })).catch(() => {}); } catch (e) {}
+    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs: {}, pso })).catch(() => {}); } catch (e) {}
   };
 
   return (
@@ -1240,7 +1229,7 @@ export default function L5ETrainer() {
           </div>
         )}
 
-        {mode !== "solution" && mode !== "recog" && mode !== "pseudov" && mode !== "tl4e" && (
+        {mode !== "solution" && mode !== "recog" && (
           <>
             <div className="chips">
               <span className="grouplabel" style={{ marginLeft: 0 }}>L5E</span>
@@ -1273,11 +1262,9 @@ export default function L5ETrainer() {
           <button className={"mode" + (mode === "recap" ? " on" : "")} onClick={() => setMode("recap")}>Recap</button>
           <button className={"mode" + (mode === "solution" ? " on" : "")} onClick={() => setMode("solution")}>Solution</button>
           <button className={"mode" + (mode === "recog" ? " on" : "")} onClick={() => setMode("recog")}>Recog</button>
-          <button className={"mode" + (mode === "pseudov" ? " on" : "")} onClick={() => setMode("pseudov")}>Pseudo V</button>
-          <button className={"mode" + (mode === "tl4e" ? " on" : "")} onClick={() => setMode("tl4e")}>TL4E</button>
         </div>
 
-        {(mode === "recog" || mode === "pseudov") && (
+        {(mode === "recog" || mode === "solution") && (
           <div className="chips" style={{ alignItems: "center" }}>
             <span className="grouplabel" style={{ marginLeft: 0 }}>offsets</span>
             <input className="offsetin mono" value={pso}
@@ -1285,14 +1272,15 @@ export default function L5ETrainer() {
               onBlur={commitOffsets}
               onKeyDown={(e) => { if (e.code === "Enter" || e.code === "NumpadEnter") { e.preventDefault(); e.target.blur(); } }}
               placeholder="e.g. L, R', L R'" aria-label="pseudo offsets" />
-            {!parsePseudoOffsets(pso) ? <span className="offsetbad">enter valid offsets (plain moves, ≤4 each)</span> : null}
+            {mode === "solution" ? <span className="offsetbad" style={{ color: "var(--faint)" }}>pseudo offsets (optional)</span>
+              : !parsePseudoOffsets(pso) ? <span className="offsetbad">enter valid offsets (plain moves, ≤4 each)</span> : null}
           </div>
         )}
 
-        {(mode === "solution" || mode === "pseudov" || mode === "tl4e") && (
+        {mode === "solution" && (
           <>
             <div className="chips">
-              <span className="grouplabel" style={{ marginLeft: 0 }}>{mode === "solution" ? "solution length" : "setup length"}</span>
+              <span className="grouplabel" style={{ marginLeft: 0 }}>length</span>
               {[1, 2, 3, 4, 5, 6, 7].map((L) => (
                 <button key={L} className={"chip" + (vlenSel.has(L) ? " on" : "")}
                   style={{ "--cdot": "var(--accent)" }} onClick={() => toggleVlen(L)}>
@@ -1327,10 +1315,8 @@ export default function L5ETrainer() {
         ) : !current ? (
           <div className="stage" style={{ cursor: "default" }}>
             <div className="empty" style={{ padding: "40px 0", textAlign: "center" }}>
-              {mode === "solution" ? "Select at least one solution length to start."
+              {mode === "solution" ? "Select at least one length to start."
                 : mode === "recog" ? "Enter at least one valid offset above to start."
-                : mode === "pseudov" ? "Enter valid offsets and select at least one setup length to start."
-                : mode === "tl4e" ? "Select at least one setup length to start."
                 : "Select at least one set to start."}
             </div>
           </div>
@@ -1359,7 +1345,7 @@ export default function L5ETrainer() {
               </>
             )}
           </div>
-        ) : current.kind === "solution" || current.kind === "pseudov" || current.kind === "tl4e" ? (
+        ) : current.kind === "solution" ? (
           <div className="stage" style={{ cursor: "default" }}>
             <div className="stagegrid">
               <div className="scramble">{current.scramble}</div>
@@ -1370,13 +1356,13 @@ export default function L5ETrainer() {
                 <div className={"timer" + (last.correct ? " good" : " bad")}>{last.correct ? "Correct" : "Not optimal"}</div>
                 <div className="reveal">
                   {!last.correct ? <span>you picked {last.guess} —</span> : null}
-                  <span>optimal {current.kind === "solution" ? "" : "setup"} is</span>
+                  <span>optimal is</span>
                   <span className="tag" style={{ "--cdot": "var(--accent)" }}>
                     <span className="dot" />{last.vlen} {last.vlen === 1 ? "move" : "moves"}
                   </span>
-                  <button className="restart" style={{ marginTop: 0 }} onClick={current.kind === "pseudov" ? nextPseudoV : current.kind === "tl4e" ? nextTL4E : nextSolution}>Next</button>
+                  <button className="restart" style={{ marginTop: 0 }} onClick={nextSolution}>Next</button>
                 </div>
-                <div className="solhead">{last.sols.length === 1 ? `optimal ${current.kind === "solution" ? "solution" : "setup"}` : `${last.sols.length} optimal ${current.kind === "solution" ? "solutions" : "setups"}`}</div>
+                <div className="solhead">{last.sols.length === 1 ? "optimal solution" : `${last.sols.length} optimal solutions`} <span className="bartag">V · pseudo V · TL4E-B</span></div>
                 <div className="sollist">
                   {last.sols.map((sol, i) => (
                     <span key={i} className="mono solpill">{sol}</span>
@@ -1385,7 +1371,7 @@ export default function L5ETrainer() {
               </>
             ) : (
               <>
-                <div className="hint" style={{ marginTop: 14 }}>{current.kind === "pseudov" ? "How many moves is the shortest setup to a pseudo V?" : current.kind === "tl4e" ? "How many moves is the shortest setup to a V with the back center twisted?" : "How many moves is the shortest solution?"}</div>
+                <div className="hint" style={{ marginTop: 14 }}>How many moves is the shortest solution?</div>
                 <div className="guessrow">
                   {[1, 2, 3, 4, 5, 6, 7].map((N) => (
                     <button key={N} className="guessbtn" onClick={() => submitGuess(N)}>{N}</button>
@@ -1435,54 +1421,6 @@ export default function L5ETrainer() {
                     <tbody>
                       {Object.keys(vfs).map(Number).sort((a, b) => a - b).map((L) => {
                         const a = vfs[String(L)];
-                        return (
-                          <tr key={L}>
-                            <td className="name">{L} moves</td>
-                            <td className="mono">{a.n}</td>
-                            <td className="mono">{a.correct}</td>
-                            <td className="mono">{Math.round((a.correct / a.n) * 100)}%</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </>
-            ) : mode === "pseudov" ? (
-              <>
-                <h3>Pseudo V — accuracy by setup length</h3>
-                {Object.keys(psStats).length === 0 ? (
-                  <div className="empty">No answers yet. Pick the setup length and your accuracy lands here.</div>
-                ) : (
-                  <table>
-                    <thead><tr><th>Length</th><th>Seen</th><th>Correct</th><th>Accuracy</th></tr></thead>
-                    <tbody>
-                      {Object.keys(psStats).map(Number).sort((a, b) => a - b).map((L) => {
-                        const a = psStats[String(L)];
-                        return (
-                          <tr key={L}>
-                            <td className="name">{L} moves</td>
-                            <td className="mono">{a.n}</td>
-                            <td className="mono">{a.correct}</td>
-                            <td className="mono">{Math.round((a.correct / a.n) * 100)}%</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </>
-            ) : mode === "tl4e" ? (
-              <>
-                <h3>TL4E — accuracy by setup length</h3>
-                {Object.keys(tl4eStats).length === 0 ? (
-                  <div className="empty">No answers yet. Pick the setup length and your accuracy lands here.</div>
-                ) : (
-                  <table>
-                    <thead><tr><th>Length</th><th>Seen</th><th>Correct</th><th>Accuracy</th></tr></thead>
-                    <tbody>
-                      {Object.keys(tl4eStats).map(Number).sort((a, b) => a - b).map((L) => {
-                        const a = tl4eStats[String(L)];
                         return (
                           <tr key={L}>
                             <td className="name">{L} moves</td>
