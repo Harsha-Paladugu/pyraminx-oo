@@ -502,18 +502,18 @@ const lookupName = (render, uTwist, caseKey) => {
   }
   return SHEET.CNAME[caseKey] || null;
 };
-function algGroups(render, uTwist) {
-  const groups = [];
-  const collect = (label, st, tw) => {
-    const exact = SHEET.ALG[stateKey(st) + "|" + tw] || [];
-    if (exact.length) groups.push({ label, exact });
+// All algs for a state's bar side, merged across the 3 AUF rotations and deduped
+// (the rotations are the same bar side — keep them in one clean list).
+function mergedAlgs(render, uTwist) {
+  const seen = new Set(), out = [];
+  const add = (st, tw) => {
+    for (const row of (SHEET.ALG[stateKey(st) + "|" + tw] || []))
+      if (!seen.has(row[0])) { seen.add(row[0]); out.push(row); }
   };
-  collect("This angle", render, uTwist);
-  const u = copyState(render); applyMove(u, "U", false);
-  collect("Do U first, then", u, (uTwist + 1) % 3);
-  const up = copyState(render); applyMove(up, "U", true);
-  collect("Do U' first, then", up, (uTwist + 2) % 3);
-  return groups;
+  add(render, uTwist);
+  const u = copyState(render); applyMove(u, "U", false); add(u, (uTwist + 1) % 3);
+  const up = copyState(render); applyMove(up, "U", true); add(up, (uTwist + 2) % 3);
+  return out;
 }
 
 function AlgList({ exact }) {
@@ -531,34 +531,46 @@ function AlgList({ exact }) {
 
 function AlgPanel({ panel, onClose }) {
   const set = SET_BY_ID[panel.set];
+  const isL4E = set && set.group === "L4E";
+  const sideLabel = (side) => (isL4E ? (L4E_LABEL[side] || "") : (BAR_LABEL[side] || ""));
   let title, body;
   if (panel.kind === "live") {
     title = lookupName(panel.render, panel.uTwist, panel.caseKey) || "Unnamed case";
-    const groups = algGroups(panel.render, panel.uTwist);
+    const algs = mergedAlgs(panel.render, panel.uTwist);
+    const side = isL4E ? openOfEkey(stateKey(panel.render)) : barOfEkey(stateKey(panel.render));
     body = (
       <>
         <div className="panelimg"><PyraminxNet state={panel.render} uTwist={panel.uTwist} /></div>
-        {groups.length === 0 ? (
+        {algs.length === 0 ? (
           <div className="empty">No algs in the sheet for this state yet.</div>
-        ) : groups.map((g, i) => (
-          <div key={i} className="alggroup">
-            <div className="grouphead">{g.label}</div>
-            <AlgList exact={g.exact} />
+        ) : (
+          <div className="alggroup">
+            {sideLabel(side) ? <div className="grouphead">{sideLabel(side)}</div> : null}
+            <AlgList exact={algs} />
           </div>
-        ))}
+        )}
       </>
     );
   } else {
     title = SHEET.CNAME[panel.caseKey] || "Unnamed case";
     const pres = SHEET.PRES[panel.caseKey] || [];
+    // group presentations by bar side; merge each side's AUF variants into one list
+    const bySide = new Map();
+    for (const [ek, tw, nm] of pres) {
+      const side = isL4E ? openOfEkey(ek) : barOfEkey(ek);
+      let g = bySide.get(side);
+      if (!g) { g = { ek, tw, nm, algs: [], seen: new Set() }; bySide.set(side, g); }
+      for (const row of (SHEET.ALG[ek + "|" + tw] || []))
+        if (!g.seen.has(row[0])) { g.seen.add(row[0]); g.algs.push(row); }
+    }
     body = pres.length === 0 ? (
       <div className="empty">No sheet entries for this case yet.</div>
-    ) : pres.map(([ek, tw, nm], i) => (
+    ) : [...bySide.entries()].map(([side, g], i) => (
       <div key={i} className="alggroup presrow">
-        <div className="panelimg small"><PyraminxNet state={keyToState(ek)} uTwist={tw} /></div>
+        <div className="panelimg small"><PyraminxNet state={keyToState(g.ek)} uTwist={g.tw} /></div>
         <div className="presbody">
-          <div className="grouphead">{nm} <span className="bartag">{panel.set === "l4e" ? (L4E_LABEL[openOfEkey(ek)] || "") : (BAR_LABEL[barOfEkey(ek)] || "")}</span></div>
-          <AlgList exact={SHEET.ALG[ek + "|" + tw] || []} />
+          <div className="grouphead">{g.nm} <span className="bartag">{sideLabel(side)}</span></div>
+          <AlgList exact={g.algs} />
         </div>
       </div>
     ));
@@ -636,9 +648,12 @@ export default function L5ETrainer() {
           const d = JSON.parse(res.value);
           if (d.caseStats) {
             const migrated = {};
-            for (const [ck, st] of Object.entries(d.caseStats)) {
-              if (!ck.includes("|")) continue; // legacy edges-only stats predate twist-distinct cases
-              migrated[ck] = st.set === "ml4e" ? { ...st, set: "l4e" } : st;
+            for (const [k, st] of Object.entries(d.caseStats)) {
+              if (k.includes("::")) { migrated[k] = st; continue; } // already per (set, angle)
+              if (!k.includes("|")) continue; // legacy edges-only stats predate twist-distinct cases
+              const set = st.set === "ml4e" ? "l4e" : (st.set || "l4e");
+              const angle = st.angle || (set === "l4e" ? "DF" : "DL"); // old data -> default orientation
+              migrated[set + "@" + angle + "::" + k] = { ...st, set, angle };
             }
             setCaseStats(migrated);
           }
@@ -651,7 +666,19 @@ export default function L5ETrainer() {
           if (Array.isArray(d.vlen)) setVlenSel(new Set(d.vlen.filter((n) => n >= 1 && n <= 7)));
           if (Array.isArray(d.goals)) { const g = d.goals.filter((x) => GOAL_TYPES.some((t) => t.id === x)); if (g.length) setGoals(new Set(g)); }
           if (Array.isArray(d.caseSel)) setCaseSel(new Set(d.caseSel.filter((k) => typeof k === "string" && SET_BY_ID[k.split(CASE_SEP)[0]])));
-          if (Array.isArray(d.caseKnown)) setCaseKnown(new Set(d.caseKnown.filter((k) => typeof k === "string" && SET_BY_ID[k.split(CASE_SEP)[0]])));
+          if (Array.isArray(d.caseKnown)) {
+            const out = [];
+            for (const k of d.caseKnown) {
+              if (typeof k !== "string") continue;
+              if (k.includes("@")) { if (SET_BY_ID[k.split("@")[0]]) out.push(k); } // new: set@angle<sep>name
+              else { // old: set<sep>name -> default orientation
+                const set = k.split(CASE_SEP)[0];
+                if (!SET_BY_ID[set]) continue;
+                out.push(set + "@" + (set === "l4e" ? "DF" : "DL") + k.slice(set.length));
+              }
+            }
+            setCaseKnown(new Set(out));
+          }
           if (["all", "learning", "known"].includes(d.scope)) setScope(d.scope);
           if (typeof d.setupOpen === "boolean") setSetupOpen(d.setupOpen);
           if (d.vfs && typeof d.vfs === "object") {
@@ -687,17 +714,15 @@ export default function L5ETrainer() {
     }, 400);
   }, [caseStats, l5eBars, l4eSlots, selected, mode, vlenSel, goals, caseSel, caseKnown, scope, setupOpen, vfs, pso]);
 
-  const makeScramble = useCallback((setId, caseKey, presArr) => {
-    // present the case at a randomly chosen selected angle (bar for L5E, open
-    // slot for L4E); both are frame rotations of the canonical case.
-    const angles = setId === "l4e" ? [...l4eSlots] : [...l5eBars];
+  const makeScramble = useCallback((setId, caseKey, presArr, angle) => {
+    // present the case at the given angle (bar for L5E, open slot for L4E); both
+    // are frame rotations of the canonical case.
     const rotMap = setId === "l4e" ? L4E_ROT : BAR_ROT;
-    const fallback = setId === "l4e" ? "DF" : "DL";
+    const a = angle || (setId === "l4e" ? "DF" : "DL");
     let physical = null, scramble = null, uTwist = 0, target = 0;
     for (let attempt = 0; attempt < 30; attempt++) {
       const pres = presArr[Math.floor(Math.random() * presArr.length)];
-      const angle = angles.length ? angles[Math.floor(Math.random() * angles.length)] : fallback;
-      physical = rotateFrame(copyState(pres.st), rotMap[angle] || 0);
+      physical = rotateFrame(copyState(pres.st), rotMap[a] || 0);
       target = pres.t;
       scramble = maskedScramble(physical, distRef.current);
       if (!scramble) continue;
@@ -709,8 +734,8 @@ export default function L5ETrainer() {
     }
     // if the generator could not hit the target twist, report the case actually shown
     const ck = scramble && uTwist === target ? caseKey : realCanonKey(physical, uTwist);
-    return { scramble, set: setId, caseKey: ck, render: physical, uTwist };
-  }, [l4eSlots, l5eBars]);
+    return { scramble, set: setId, angle: a, caseKey: ck, render: physical, uTwist };
+  }, []);
 
   const poolOf = useCallback((id) => {
     const pools = poolsRef.current;
@@ -758,72 +783,104 @@ export default function L5ETrainer() {
 
   // Per-case "known" status (manual). Mirrors caseSel; caseKnown holds KNOWN
   // names, so a case is unknown unless explicitly marked.
-  const caseIsKnown = (setId, name) => caseKnown.has(nmId(setId, name));
-  const toggleKnown = (setId, name) => {
-    setCaseKnown((s) => { const n = new Set(s); const k = nmId(setId, name); if (n.has(k)) n.delete(k); else n.add(k); return n; });
+  // Known is tracked per (set, ANGLE): vkOf(setId, angle) + name. The picker
+  // shows/edits known across the currently-active angles (bar/slot menu); the
+  // stop screen marks the exact angle that was shown.
+  const vkOf = (setId, angle) => setId + "@" + angle;
+  const anglesActive = (setId) => [...(setId === "l4e" ? l4eSlots : l5eBars)];
+  const caseKnownAt = (setId, angle, name) => caseKnown.has(vkOf(setId, angle) + CASE_SEP + name);
+  const caseKnownAllActive = (setId, name) => {
+    const a = anglesActive(setId);
+    return a.length > 0 && a.every((g) => caseKnownAt(setId, g, name));
   };
-  const setAllKnown = (setId, known) => {
+  const toggleKnownActive = (setId, name) => {
+    const a = anglesActive(setId); if (!a.length) return;
     setCaseKnown((s) => {
       const n = new Set(s);
-      for (const { name } of casesOf(setId)) { const k = nmId(setId, name); if (known) n.add(k); else n.delete(k); }
+      const all = a.every((g) => n.has(vkOf(setId, g) + CASE_SEP + name));
+      for (const g of a) { const k = vkOf(setId, g) + CASE_SEP + name; if (all) n.delete(k); else n.add(k); }
       return n;
     });
   };
-  const knownCount = useCallback((setId) =>
-    casesOf(setId).filter(({ name }) => caseKnown.has(nmId(setId, name))).length, [casesOf, caseKnown]);
+  const toggleKnownKey = (key) =>
+    setCaseKnown((s) => { const n = new Set(s); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const setAllKnownActive = (setId, known) => {
+    const a = anglesActive(setId);
+    setCaseKnown((s) => {
+      const n = new Set(s);
+      for (const { name } of casesOf(setId)) for (const g of a) { const k = vkOf(setId, g) + CASE_SEP + name; if (known) n.add(k); else n.delete(k); }
+      return n;
+    });
+  };
+  // cases known across ALL active angles (for the picker header / progress)
+  const knownCountActive = useCallback((setId) => {
+    const a = [...(setId === "l4e" ? l4eSlots : l5eBars)];
+    if (!a.length) return 0;
+    return casesOf(setId).filter(({ name }) => a.every((g) => caseKnown.has(vkOf(setId, g) + CASE_SEP + name))).length;
+  }, [casesOf, caseKnown, l4eSlots, l5eBars]);
+  // cases known at one specific angle (for the per-variant stats rows)
+  const knownCountAngle = (setId, angle) =>
+    casesOf(setId).filter(({ name }) => caseKnown.has(vkOf(setId, angle) + CASE_SEP + name)).length;
   // identity of the just-solved drill/recap case (last, not current — stopTimer
   // already advanced current). null for recog/solution (no named-case identity).
   const lastKnownId = () => {
     if (!last || last.kind || !last.set) return null;
     const name = SHEET.CNAME[last.caseKey] || last.caseKey;
-    return { setId: last.set, name, key: nmId(last.set, name) };
+    return { setId: last.set, angle: last.angle, name, key: vkOf(last.set, last.angle) + CASE_SEP + name };
   };
 
   const nextDrill = useCallback(() => {
-    // enabled classes only, weighted by how many physical states each holds
+    // enabled classes × each active angle, weighted by physical states. Known
+    // status is per (set, angle), so scope filters per orientation.
     const entries = [];
     for (const id of selected) {
       const pool = poolOf(id); if (!pool) continue;
-      if ((id === "l4e" ? l4eSlots : l5eBars).size === 0) continue; // no presentation angle picked
+      const angles = [...(id === "l4e" ? l4eSlots : l5eBars)];
+      if (!angles.length) continue; // no presentation angle picked
       for (const [ck, sts] of pool.classes) {
         const name = SHEET.CNAME[ck] || ck;
         if (id === "l4e" && /^ML4E/.test(name)) continue;
         if (caseSel.has(id + CASE_SEP + name)) continue;
-        const kn = caseKnown.has(id + CASE_SEP + name);
-        if (scope === "learning" && kn) continue;
-        if (scope === "known" && !kn) continue;
-        entries.push({ id, ck, sts });
+        for (const angle of angles) {
+          const kn = caseKnown.has(vkOf(id, angle) + CASE_SEP + name);
+          if (scope === "learning" && kn) continue;
+          if (scope === "known" && !kn) continue;
+          entries.push({ id, ck, sts, angle });
+        }
       }
     }
     const total = entries.reduce((a, e) => a + e.sts.length, 0);
     if (!total) { setCurrent(null); return; }
     let r = Math.floor(Math.random() * total);
     for (const e of entries) {
-      if (r < e.sts.length) { setCurrent(makeScramble(e.id, e.ck, e.sts)); return; }
+      if (r < e.sts.length) { setCurrent(makeScramble(e.id, e.ck, e.sts, e.angle)); return; }
       r -= e.sts.length;
     }
   }, [selected, caseSel, caseKnown, scope, l4eSlots, l5eBars, makeScramble, poolOf]);
 
   const startRecap = useCallback(() => {
-    // one entry per enabled named case (a representative state), so recap walks
-    // each case once rather than every canonical variant
+    // one entry per enabled named case × active angle, so recap walks each
+    // (case, orientation) once
     const q = [];
     for (const id of [...selected]) {
       if (!poolOf(id)) continue;
-      if ((id === "l4e" ? l4eSlots : l5eBars).size === 0) continue; // no presentation angle picked
+      const angles = [...(id === "l4e" ? l4eSlots : l5eBars)];
+      if (!angles.length) continue; // no presentation angle picked
       for (const { name, keys } of casesOf(id)) {
         if (caseSel.has(id + CASE_SEP + name)) continue;
-        const kn = caseKnown.has(id + CASE_SEP + name);
-        if (scope === "learning" && kn) continue;
-        if (scope === "known" && !kn) continue;
-        q.push({ set: id, caseKey: keys[0] });
+        for (const angle of angles) {
+          const kn = caseKnown.has(vkOf(id, angle) + CASE_SEP + name);
+          if (scope === "learning" && kn) continue;
+          if (scope === "known" && !kn) continue;
+          q.push({ set: id, caseKey: keys[0], angle });
+        }
       }
     }
     const queue = shuffled(q);
     setRecap({ queue, idx: 0 });
     if (queue.length) {
       const it = queue[0];
-      setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey)));
+      setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey), it.angle));
     } else setCurrent(null);
   }, [selected, caseSel, caseKnown, scope, l4eSlots, l5eBars, casesOf, makeScramble, poolOf]);
 
@@ -928,7 +985,7 @@ export default function L5ETrainer() {
     if (!offs || !pool || !pool.states.length) return null;
     for (let attempt = 0; attempt < 25; attempt++) {
       const pres = pool.states[Math.floor(Math.random() * pool.states.length)];
-      const base = makeScramble("l4e", pres.caseKey, pool.classes.get(pres.caseKey));
+      const base = makeScramble("l4e", pres.caseKey, pool.classes.get(pres.caseKey), "DF");
       if (!base || !base.scramble) continue;
       const off = offs[Math.floor(Math.random() * offs.length)];
       const render = applyMoveString(off.str, base.render);   // pseudo = case . offset
@@ -974,7 +1031,7 @@ export default function L5ETrainer() {
       const idx = r.idx + 1;
       if (idx >= r.queue.length) { setCurrent(null); return { ...r, idx }; }
       const it = r.queue[idx];
-      setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey)));
+      setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey), it.angle));
       return { ...r, idx };
     });
   }, [mode, nextDrill, nextSolution, nextRecog, makeScramble, poolOf]);
@@ -1008,12 +1065,13 @@ export default function L5ETrainer() {
     setElapsed(ms);
     setPhase("stopped");
     if (current) {
-      const rec = { ms, set: current.set, caseKey: current.caseKey, render: current.render, uTwist: current.uTwist };
+      const rec = { ms, set: current.set, angle: current.angle, caseKey: current.caseKey, render: current.render, uTwist: current.uTwist };
       setLast(rec);
       setSession((s) => [...s.slice(-49), rec]);
+      const sk = vkOf(current.set, current.angle) + "::" + current.caseKey; // per (set, angle)
       setCaseStats((cs) => {
-        const prev = cs[current.caseKey] || { n: 0, best: Infinity, sum: 0, set: current.set };
-        return { ...cs, [current.caseKey]: { set: current.set, n: prev.n + 1, best: Math.min(prev.best, ms), sum: prev.sum + ms } };
+        const prev = cs[sk] || { n: 0, best: Infinity, sum: 0, set: current.set, angle: current.angle };
+        return { ...cs, [sk]: { set: current.set, angle: current.angle, n: prev.n + 1, best: Math.min(prev.best, ms), sum: prev.sum + ms } };
       });
     }
     advance();
@@ -1052,7 +1110,7 @@ export default function L5ETrainer() {
       if (phase === "stopped" && e.code === "KeyK") {  // mark the just-solved case known/unknown
         e.preventDefault();
         if (last && !last.kind && last.set) {
-          const nm = last.set + CASE_SEP + (SHEET.CNAME[last.caseKey] || last.caseKey);
+          const nm = vkOf(last.set, last.angle) + CASE_SEP + (SHEET.CNAME[last.caseKey] || last.caseKey);
           setCaseKnown((s) => { const n = new Set(s); if (n.has(nm)) n.delete(nm); else n.add(nm); return n; });
         }
         return;
@@ -1066,15 +1124,21 @@ export default function L5ETrainer() {
 
   useEffect(() => () => cancelAnimationFrame(raf.current), []);
 
+  // aggregate per VARIANT = (set, angle), so each orientation gets its own row
   const setAgg = useMemo(() => {
     const agg = {};
     for (const st of Object.values(caseStats)) {
-      const a = agg[st.set] || { n: 0, best: Infinity, sum: 0, cases: 0 };
+      const vkk = (st.set || "?") + "@" + (st.angle || "DL");
+      const a = agg[vkk] || { set: st.set, angle: st.angle || "DL", n: 0, best: Infinity, sum: 0, cases: 0 };
       a.n += st.n; a.best = Math.min(a.best, st.best); a.sum += st.sum; a.cases += 1;
-      agg[st.set] = a;
+      agg[vkk] = a;
     }
     return agg;
   }, [caseStats]);
+  const angleLabel = (setId, angle) => {
+    const opt = (SET_BY_ID[setId] && SET_BY_ID[setId].group === "L4E" ? L4E_SLOTS : L5E_BARS).find((o) => o.id === angle);
+    return opt ? opt.label : angle;
+  };
 
   const toggleSet = (id) => {
     setSelected((s) => {
@@ -1168,7 +1232,7 @@ export default function L5ETrainer() {
               {(() => {
                 const sel = SETS.filter((s) => selected.has(s.id));
                 const tot = sel.reduce((a, s) => a + casesOf(s.id).length, 0);
-                const kno = sel.reduce((a, s) => a + knownCount(s.id), 0);
+                const kno = sel.reduce((a, s) => a + knownCountActive(s.id), 0);
                 const summary = `${selected.size} set${selected.size === 1 ? "" : "s"}${tot ? ` · ${kno}/${tot} known` : ""}`;
                 return (
                   <button className="setuphead" onClick={() => setSetupOpen((o) => !o)}>
@@ -1221,7 +1285,7 @@ export default function L5ETrainer() {
                         <button key={s.id} className="chip" style={{ "--cdot": s.color }} onClick={() => setCaseBrowser(s.id)}>
                           <span className="dot" />{s.name}
                           <span className="ct">{enabledCount(s.id)}/{casesOf(s.id).length}</span>
-                          <span className="ct" style={{ color: "var(--green)" }}>{knownCount(s.id)}✓</span>
+                          <span className="ct" style={{ color: "var(--green)" }}>{knownCountActive(s.id)}✓</span>
                         </button>
                       ))}
                     </div>
@@ -1400,7 +1464,7 @@ export default function L5ETrainer() {
                   return (
                     <button className={"markbtn ok" + (isK ? " sel" : "")} title="mark known (K)"
                       onPointerDown={(e) => e.stopPropagation()}
-                      onClick={(e) => { e.stopPropagation(); toggleKnown(k.setId, k.name); }}>
+                      onClick={(e) => { e.stopPropagation(); toggleKnownKey(k.key); }}>
                       {isK ? "Known ✓" : "Mark known"}
                     </button>
                   );
@@ -1452,40 +1516,51 @@ export default function L5ETrainer() {
                   <table>
                     <thead><tr><th>Set</th><th>Solves</th><th>Cases seen</th><th>Known</th><th>Best</th><th>Mean</th></tr></thead>
                     <tbody>
-                      {SETS.filter((s) => setAgg[s.id]).map((s) => {
-                        const a = setAgg[s.id];
-                        return (
-                          <tr key={s.id} className="setrow" onClick={() => setExpandedSet(expandedSet === s.id ? null : s.id)}>
-                            <td className="name">
-                              <span className="dot" style={{ background: s.color }} />{s.name}
-                              <span className="chev">{expandedSet === s.id ? "▾" : "▸"}</span>
-                            </td>
-                            <td className="mono">{a.n}</td>
-                            <td className="mono">{a.cases}{counts[s.id] ? ` / ${counts[s.id]}` : ""}</td>
-                            <td className="mono">{knownCount(s.id)}{counts[s.id] ? ` / ${counts[s.id]}` : ""}</td>
-                            <td className="mono">{fmt(a.best)}</td>
-                            <td className="mono">{fmt(a.sum / a.n)}</td>
-                          </tr>
-                        );
-                      })}
+                      {Object.keys(setAgg)
+                        .sort((x, y) => {
+                          const ax = setAgg[x], ay = setAgg[y];
+                          return (SETS.findIndex((s) => s.id === ax.set) - SETS.findIndex((s) => s.id === ay.set))
+                            || angleLabel(ax.set, ax.angle).localeCompare(angleLabel(ay.set, ay.angle));
+                        })
+                        .map((vkk) => {
+                          const a = setAgg[vkk];
+                          const s = SET_BY_ID[a.set]; if (!s) return null;
+                          const denom = counts[a.set];
+                          return (
+                            <tr key={vkk} className="setrow" onClick={() => setExpandedSet(expandedSet === vkk ? null : vkk)}>
+                              <td className="name">
+                                <span className="dot" style={{ background: s.color }} />{s.name} · {angleLabel(a.set, a.angle)}
+                                <span className="chev">{expandedSet === vkk ? "▾" : "▸"}</span>
+                              </td>
+                              <td className="mono">{a.n}</td>
+                              <td className="mono">{a.cases}{denom ? ` / ${denom}` : ""}</td>
+                              <td className="mono">{knownCountAngle(a.set, a.angle)}{denom ? ` / ${denom}` : ""}</td>
+                              <td className="mono">{fmt(a.best)}</td>
+                              <td className="mono">{fmt(a.sum / a.n)}</td>
+                            </tr>
+                          );
+                        })}
                     </tbody>
                   </table>
                 )}
                 {expandedSet && setAgg[expandedSet] && (
                   <div className="casegrid">
                     {Object.entries(caseStats)
-                      .filter(([, st]) => st.set === expandedSet)
+                      .filter(([, st]) => (st.set + "@" + (st.angle || "DL")) === expandedSet)
                       .sort((a, b) => b[1].sum / b[1].n - a[1].sum / a[1].n)
-                      .map(([ck, st]) => (
-                        <div key={ck} className="casecard click" onClick={() => setPanel({ kind: "class", caseKey: ck, set: st.set })}>
-                          <PyraminxNet state={displayState(ck, st.set, st.set === "l4e" ? ([...l4eSlots][0] || "DF") : ([...l5eBars][0] || "DL"))} uTwist={+ck.split("|")[1]} />
-                          <div className="casenums">
-                            <span className="mono">{fmt(st.sum / st.n)}</span>
-                            <span className="casesub">{SHEET.CNAME[ck] || "unnamed"}</span>
-                            <span className="casesub">best {fmt(st.best)} · {st.n}×</span>
+                      .map(([fk, st]) => {
+                        const ck = fk.includes("::") ? fk.slice(fk.indexOf("::") + 2) : fk;
+                        return (
+                          <div key={fk} className="casecard click" onClick={() => setPanel({ kind: "class", caseKey: ck, set: st.set })}>
+                            <PyraminxNet state={displayState(ck, st.set, st.angle || (st.set === "l4e" ? "DF" : "DL"))} uTwist={+ck.split("|")[1]} />
+                            <div className="casenums">
+                              <span className="mono">{fmt(st.sum / st.n)}</span>
+                              <span className="casesub">{SHEET.CNAME[ck] || "unnamed"}</span>
+                              <span className="casesub">best {fmt(st.best)} · {st.n}×</span>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                   </div>
                 )}
               </>
@@ -1518,19 +1593,24 @@ export default function L5ETrainer() {
                 <div className="modalhead">
                   <div>
                     <div className="modaltitle">{s.name} cases</div>
-                    <span className="tag" style={{ "--cdot": s.color }}><span className="dot" />{enabledCount(s.id)}/{cases.length} on · {knownCount(s.id)} known</span>
+                    <span className="tag" style={{ "--cdot": s.color }}><span className="dot" />{enabledCount(s.id)}/{cases.length} on · {knownCountActive(s.id)} known</span>
                   </div>
                   <button className="closebtn" onClick={() => setCaseBrowser(null)}>{"×"}</button>
                 </div>
+                {(() => {
+                  const opts = s.group === "L4E" ? L4E_SLOTS : L5E_BARS;
+                  const labels = anglesActive(s.id).map((g) => (opts.find((o) => o.id === g) || {}).label).filter(Boolean);
+                  return <div className="hint" style={{ textAlign: "left", margin: "0 0 8px" }}>known is per {s.group === "L4E" ? "slot" : "bar"} — editing: {labels.length ? labels.join(", ") : "(none selected)"}</div>;
+                })()}
                 <div className="presets" style={{ margin: "0 0 10px" }}>
                   <button className="preset" onClick={() => setAllCases(s.id, true)}>all</button>
                   <button className="preset" onClick={() => setAllCases(s.id, false)}>none</button>
-                  <button className="preset" onClick={() => setAllKnown(s.id, true)}>mark all known</button>
-                  <button className="preset" onClick={() => setAllKnown(s.id, false)}>mark all unknown</button>
+                  <button className="preset" onClick={() => setAllKnownActive(s.id, true)}>mark all known</button>
+                  <button className="preset" onClick={() => setAllKnownActive(s.id, false)}>mark all unknown</button>
                 </div>
                 <div className="chips">
                   {cases.map(({ name }) => {
-                    const kn = caseIsKnown(s.id, name);
+                    const kn = caseKnownAllActive(s.id, name);
                     return (
                       <span key={name} className="markwrap">
                         <button className={"chip" + (caseEnabled(s.id, name) ? " on" : "")}
@@ -1538,14 +1618,14 @@ export default function L5ETrainer() {
                           <span className="dot" />{name}{kn ? " ✓" : ""}
                         </button>
                         <button className={"markbtn ok" + (kn ? " sel" : "")} title="mark known"
-                          onClick={() => toggleKnown(s.id, name)}>K</button>
+                          onClick={() => toggleKnownActive(s.id, name)}>K</button>
                       </span>
                     );
                   })}
                 </div>
                 <div className="recapbar" style={{ margin: "12px 2px 0" }}>
-                  <span className="mono">{knownCount(s.id)}/{cases.length} known</span>
-                  <div className="rtrack"><div className="rfill" style={{ width: `${cases.length ? (knownCount(s.id) / cases.length) * 100 : 0}%` }} /></div>
+                  <span className="mono">{knownCountActive(s.id)}/{cases.length} known</span>
+                  <div className="rtrack"><div className="rfill" style={{ width: `${cases.length ? (knownCountActive(s.id) / cases.length) * 100 : 0}%` }} /></div>
                 </div>
               </div>
             </div>
