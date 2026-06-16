@@ -59,6 +59,11 @@
 .algrow.warn .alg { color: var(--mut); }
 .addedtag { font: 500 10px var(--mono); color: var(--green); border: 1px solid var(--green); border-radius: 5px; padding: 0 4px; opacity: .8; }
 .warntag { color: var(--yellow); cursor: help; }
+.algrow .ord { display: inline-flex; flex-direction: column; line-height: .8; }
+.algrow .ord .mv { background: none; border: 0; color: var(--dim); font-size: 11px; line-height: 1;
+  cursor: pointer; padding: 0 2px; border-radius: 4px; }
+.algrow .ord .mv:hover:not(:disabled) { color: var(--txt); background: var(--panel2); }
+.algrow .ord .mv:disabled { opacity: .25; cursor: default; }
 .algrow .rm { margin-left: auto; background: none; border: 0; color: var(--dim); font-size: 18px; line-height: 1;
   cursor: pointer; padding: 0 4px; border-radius: 5px; }
 .algrow .rm:hover { color: var(--red); background: var(--panel2); }

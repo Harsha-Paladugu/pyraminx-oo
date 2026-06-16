@@ -515,16 +515,34 @@ const lookupName = (render, uTwist, caseKey) => {
   }
   return SHEET.CNAME[caseKey] || null;
 };
-// Every alg for a case at one bar/slot angle. Pulls from ALL stored
-// presentations at that angle (a symmetric case can have more than the 3 AUF
-// rotations, so a 3-AUF scan of the shown state would miss some), deduped.
-function algsForCaseAngle(caseKey, side, isL4E) {
-  const seen = new Set(), out = [];
-  for (const [ek, tw] of (SHEET.PRES[caseKey] || [])) {
-    if ((isL4E ? openOfEkey(ek) : barOfEkey(ek)) !== side) continue;
-    for (const row of (SHEET.ALG[ek + "|" + tw] || []))
-      if (!seen.has(row[0])) { seen.add(row[0]); out.push(row); }
+// Prepend an AUF move to an alg (merging with a leading U turn), so an alg that
+// solves a U-rotation of the shown state instead solves the shown state itself.
+const U_AMT = { U: 1, "U'": 2, U2: 2, "U2'": 1 };
+function withAUF(auf, alg) {
+  if (!auf) return alg;
+  const toks = alg.split(" ");
+  if (U_AMT[toks[0]] != null) {                       // fold into the leading U turn
+    const v = (U_AMT[auf] + U_AMT[toks[0]]) % 3;
+    if (v === 0) toks.shift(); else toks[0] = v === 1 ? "U" : "U'";
+    return toks.join(" ");
   }
+  return auf + " " + alg;
+}
+// Every alg that solves the shown scramble at the shown angle. AUF is accounted
+// for: algs stored at a U-rotation of this exact state are included with the
+// matching AUF folded in, so each listed alg solves the scramble as displayed.
+// Deduped; never pulls in algs for other orientations/angles.
+function mergedAlgs(render, uTwist) {
+  const seen = new Set(), out = [];
+  const add = (st, tw, auf) => {
+    for (const row of (SHEET.ALG[stateKey(st) + "|" + tw] || [])) {
+      const alg = withAUF(auf, row[0]);
+      if (!seen.has(alg)) { seen.add(alg); out.push([alg, row[1]]); }
+    }
+  };
+  add(render, uTwist, "");
+  const u = copyState(render); applyMove(u, "U", false); add(u, (uTwist + 1) % 3, "U");
+  const up = copyState(render); applyMove(up, "U", true); add(up, (uTwist + 2) % 3, "U'");
   return out;
 }
 
@@ -548,8 +566,8 @@ function AlgPanel({ panel, onClose }) {
   let title, body;
   if (panel.kind === "live") {
     title = lookupName(panel.render, panel.uTwist, panel.caseKey) || "Unnamed case";
+    const algs = mergedAlgs(panel.render, panel.uTwist);
     const side = isL4E ? openOfEkey(stateKey(panel.render)) : barOfEkey(stateKey(panel.render));
-    const algs = algsForCaseAngle(panel.caseKey, side, isL4E);
     body = (
       <>
         <div className="panelimg"><PyraminxNet state={panel.render} uTwist={panel.uTwist} /></div>
