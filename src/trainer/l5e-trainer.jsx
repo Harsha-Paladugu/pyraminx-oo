@@ -511,6 +511,16 @@ const shuffled = (a) => {
   return arr;
 };
 const STORE_KEY = "l5e-trainer-v2";
+
+// Solution Trainer goal types: the user picks any combination and the trainer
+// solves to the UNION of the selected goals. Order here is the display order
+// and the canonical order for the combined-table cache key.
+const GOAL_TYPES = [
+  { id: "v", label: "V" },
+  { id: "pv", label: "Pseudo V" },
+  { id: "tl4e", label: "TL4E-B" },
+];
+const goalsKeyOf = (goals) => GOAL_TYPES.filter((g) => goals.has(g.id)).map((g) => g.id).join(",");
 const keyToState = (ck) => ({ e: ck.split(",").flatMap((t) => [+t[0], +t[1]]), c: [0, 0, 0] });
 const displayState = (caseKey, setId, bar) => {
   // rotate the canonical case into the frame matching the active bar
@@ -669,6 +679,7 @@ export default function L5ETrainer() {
   const [selected, setSelected] = useState(() => new Set(L5E_IDS));
   const [mode, setMode] = useState("drill");
   const [vlenSel, setVlenSel] = useState(() => new Set([3, 4, 5, 6])); // target solution lengths (Solution Trainer)
+  const [goals, setGoals] = useState(() => new Set(["v", "pv", "tl4e"])); // which goal types the Solution union includes
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [current, setCurrent] = useState(null); // {scramble, set, caseKey, render, uTwist}
@@ -709,6 +720,7 @@ export default function L5ETrainer() {
           if (["drill", "recap", "solution", "recog"].includes(d.mode)) setMode(d.mode);
           if (typeof d.pso === "string") setPso(d.pso);
           if (Array.isArray(d.vlen)) setVlenSel(new Set(d.vlen.filter((n) => n >= 1 && n <= 7)));
+          if (Array.isArray(d.goals)) { const g = d.goals.filter((x) => GOAL_TYPES.some((t) => t.id === x)); if (g.length) setGoals(new Set(g)); }
           if (d.vfs && typeof d.vfs === "object") {
             const v = {};
             for (const [k, st] of Object.entries(d.vfs)) if (/^[1-7]$/.test(k)) v[k] = st;
@@ -737,10 +749,10 @@ export default function L5ETrainer() {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       try {
-        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs, pso })).catch(() => {});
+        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], vfs, pso })).catch(() => {});
       } catch (e) {}
     }, 400);
-  }, [caseStats, bar, selected, mode, vlenSel, vfs, pso]);
+  }, [caseStats, bar, selected, mode, vlenSel, goals, vfs, pso]);
 
   const makeScramble = useCallback((setId, caseKey, presArr) => {
     let physical = null, scramble = null, uTwist = 0, target = 0;
@@ -837,9 +849,12 @@ export default function L5ETrainer() {
   // when the offsets change (the pseudo-V part depends on them).
   const ensureSolution = useCallback(() => {
     if (!vdistRef.current || !tl4eDistRef.current) return;
-    if (combinedForRef.current === pso && combinedDistRef.current) return;
-    const tables = [vdistRef.current, tl4eDistRef.current];
-    const offs = parsePseudoOffsets(pso);
+    const offs = goals.has("pv") ? parsePseudoOffsets(pso) : null;
+    const key = goalsKeyOf(goals) + "|" + (offs ? pso : "");
+    if (combinedForRef.current === key && combinedDistRef.current) return;
+    const tables = [];
+    if (goals.has("v")) tables.push(vdistRef.current);
+    if (goals.has("tl4e")) tables.push(tl4eDistRef.current);
     if (offs) {
       if (pseudoVForRef.current !== pso || !pseudoVdistRef.current) {
         pseudoVdistRef.current = buildPseudoVDist(vbucketsRef.current[0], offs, distRef.current);
@@ -847,10 +862,11 @@ export default function L5ETrainer() {
       }
       tables.push(pseudoVdistRef.current);
     }
+    combinedForRef.current = key;
+    if (!tables.length) { combinedDistRef.current = null; combinedBucketsRef.current = null; return; }
     combinedDistRef.current = combineDists(tables);
     combinedBucketsRef.current = buildVBuckets(distRef.current, combinedDistRef.current);
-    combinedForRef.current = pso;
-  }, [pso]);
+  }, [pso, goals]);
 
   const nextSolution = useCallback(() => {
     setPhase("ready"); setLast(null); setGuessMsg("");
@@ -872,7 +888,7 @@ export default function L5ETrainer() {
     }
     const correct = n === current.vlen;
     setGuessMsg("");
-    setLast({ kind: "solution", guess: n, correct, vlen: current.vlen, render: current.render, uTwist: current.uTwist, sols: allOptimalVs(current.render, combinedDistRef.current) });
+    setLast({ kind: "solution", guess: n, correct, vlen: current.vlen, render: current.render, uTwist: current.uTwist, sols: allOptimalVs(current.render, combinedDistRef.current), goalsLabel: GOAL_TYPES.filter((g) => goals.has(g.id)).map((g) => g.label).join(" · ") });
     setPhase("stopped");
     setSession((s) => [...s.slice(-49), { kind: "solution", correct, vlen: current.vlen }]);
     setVfs((v) => {
@@ -880,7 +896,7 @@ export default function L5ETrainer() {
       const prev = v[key] || { n: 0, correct: 0 };
       return { ...v, [key]: { n: prev.n + 1, correct: prev.correct + (correct ? 1 : 0) } };
     });
-  }, [current, phase, allOptimalVs]);
+  }, [current, phase, allOptimalVs, goals]);
 
   // Recog (Feature 1): pseudo L4E recognition, setup-move framing. The pseudo
   // state is a home-bar L4E case with the offset applied to it, so undoing one
@@ -953,7 +969,7 @@ export default function L5ETrainer() {
     else if (mode === "drill") nextDrill();
     else startRecap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, bar, selected, mode, vlenSel]);
+  }, [ready, bar, selected, mode, vlenSel, goals]);
 
   const tick = useCallback(() => {
     setElapsed(performance.now() - t0.current);
@@ -1055,13 +1071,16 @@ export default function L5ETrainer() {
   const toggleVlen = (L) => {
     setVlenSel((s) => { const n = new Set(s); if (n.has(L)) n.delete(L); else n.add(L); return n; });
   };
+  const toggleGoal = (g) => {
+    setGoals((s) => { const n = new Set(s); if (n.has(g)) n.delete(g); else n.add(g); return n; });
+  };
 
   const resetStats = () => {
     setCaseStats({});
     setVfs({});
     setSession([]);
     setLast(null);
-    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], vfs: {}, pso })).catch(() => {}); } catch (e) {}
+    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], vfs: {}, pso })).catch(() => {}); } catch (e) {}
   };
 
   return (
@@ -1264,7 +1283,19 @@ export default function L5ETrainer() {
           <button className={"mode" + (mode === "recog" ? " on" : "")} onClick={() => setMode("recog")}>Recog</button>
         </div>
 
-        {(mode === "recog" || mode === "solution") && (
+        {mode === "solution" && (
+          <div className="chips">
+            <span className="grouplabel" style={{ marginLeft: 0 }}>goals</span>
+            {GOAL_TYPES.map((g) => (
+              <button key={g.id} className={"chip" + (goals.has(g.id) ? " on" : "")}
+                style={{ "--cdot": "var(--accent)" }} onClick={() => toggleGoal(g.id)}>
+                <span className="dot" />{g.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {(mode === "recog" || (mode === "solution" && goals.has("pv"))) && (
           <div className="chips" style={{ alignItems: "center" }}>
             <span className="grouplabel" style={{ marginLeft: 0 }}>offsets</span>
             <input className="offsetin mono" value={pso}
@@ -1272,7 +1303,9 @@ export default function L5ETrainer() {
               onBlur={commitOffsets}
               onKeyDown={(e) => { if (e.code === "Enter" || e.code === "NumpadEnter") { e.preventDefault(); e.target.blur(); } }}
               placeholder="e.g. L, R', L R'" aria-label="pseudo offsets" />
-            {mode === "solution" ? <span className="offsetbad" style={{ color: "var(--faint)" }}>pseudo offsets (optional)</span>
+            {mode === "solution" ? (!parsePseudoOffsets(pso)
+                ? <span className="offsetbad">enter valid offsets (plain moves, ≤4 each)</span>
+                : <span className="offsetbad" style={{ color: "var(--faint)" }}>pseudo V offsets</span>)
               : !parsePseudoOffsets(pso) ? <span className="offsetbad">enter valid offsets (plain moves, ≤4 each)</span> : null}
           </div>
         )}
@@ -1315,7 +1348,11 @@ export default function L5ETrainer() {
         ) : !current ? (
           <div className="stage" style={{ cursor: "default" }}>
             <div className="empty" style={{ padding: "40px 0", textAlign: "center" }}>
-              {mode === "solution" ? "Select at least one length to start."
+              {mode === "solution" ? (
+                  goals.size === 0 ? "Select at least one goal type (V, Pseudo V, TL4E-B) to start."
+                  : (goals.size === 1 && goals.has("pv") && !parsePseudoOffsets(pso)) ? "Enter at least one valid offset above to start."
+                  : vlenSel.size === 0 ? "Select at least one length to start."
+                  : "No solutions at the selected lengths for these goals — pick other lengths.")
                 : mode === "recog" ? "Enter at least one valid offset above to start."
                 : "Select at least one set to start."}
             </div>
@@ -1362,7 +1399,7 @@ export default function L5ETrainer() {
                   </span>
                   <button className="restart" style={{ marginTop: 0 }} onClick={nextSolution}>Next</button>
                 </div>
-                <div className="solhead">{last.sols.length === 1 ? "optimal solution" : `${last.sols.length} optimal solutions`} <span className="bartag">V · pseudo V · TL4E-B</span></div>
+                <div className="solhead">{last.sols.length === 1 ? "optimal solution" : `${last.sols.length} optimal solutions`} <span className="bartag">{last.goalsLabel || "V · Pseudo V · TL4E-B"}</span></div>
                 <div className="sollist">
                   {last.sols.map((sol, i) => (
                     <span key={i} className="mono solpill">{sol}</span>
