@@ -694,6 +694,8 @@ export default function L5ETrainer() {
   const [recap, setRecap] = useState(null);
   const [expandedSet, setExpandedSet] = useState(null);
   const [panel, setPanel] = useState(null);
+  const [caseSel, setCaseSel] = useState(() => new Set()); // DISABLED cases "setId|caseKey" (default: all enabled)
+  const [caseBrowser, setCaseBrowser] = useState(null);    // which set's case list is open in the picker
 
   const t0 = useRef(0);
   const raf = useRef(0);
@@ -721,6 +723,7 @@ export default function L5ETrainer() {
           if (typeof d.pso === "string") setPso(d.pso);
           if (Array.isArray(d.vlen)) setVlenSel(new Set(d.vlen.filter((n) => n >= 1 && n <= 7)));
           if (Array.isArray(d.goals)) { const g = d.goals.filter((x) => GOAL_TYPES.some((t) => t.id === x)); if (g.length) setGoals(new Set(g)); }
+          if (Array.isArray(d.caseSel)) setCaseSel(new Set(d.caseSel.filter((k) => typeof k === "string" && SET_BY_ID[k.split("|")[0]])));
           if (d.vfs && typeof d.vfs === "object") {
             const v = {};
             for (const [k, st] of Object.entries(d.vfs)) if (/^[1-7]$/.test(k)) v[k] = st;
@@ -749,10 +752,10 @@ export default function L5ETrainer() {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       try {
-        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], vfs, pso })).catch(() => {});
+        window.storage.set(STORE_KEY, JSON.stringify({ caseStats, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], caseSel: [...caseSel], vfs, pso })).catch(() => {});
       } catch (e) {}
     }, 400);
-  }, [caseStats, bar, selected, mode, vlenSel, goals, vfs, pso]);
+  }, [caseStats, bar, selected, mode, vlenSel, goals, caseSel, vfs, pso]);
 
   const makeScramble = useCallback((setId, caseKey, presArr) => {
     let physical = null, scramble = null, uTwist = 0, target = 0;
@@ -779,26 +782,29 @@ export default function L5ETrainer() {
   }, [bar]);
 
   const nextDrill = useCallback(() => {
-    const ids = [...selected].filter((id) => poolOf(id));
-    if (!ids.length) { setCurrent(null); return; }
-    const total = ids.reduce((a, id) => a + poolOf(id).states.length, 0);
-    let r = Math.floor(Math.random() * total);
-    for (const id of ids) {
-      const n = poolOf(id).states.length;
-      if (r < n) {
-        const pick = poolOf(id).states[r];
-        setCurrent(makeScramble(id, pick.caseKey, poolOf(id).classes.get(pick.caseKey)));
-        return;
+    // enabled classes only, weighted by how many physical states each holds
+    const entries = [];
+    for (const id of selected) {
+      const pool = poolOf(id); if (!pool) continue;
+      for (const [ck, sts] of pool.classes) {
+        if (caseSel.has(id + "|" + ck)) continue;
+        entries.push({ id, ck, sts });
       }
-      r -= n;
     }
-  }, [selected, makeScramble, poolOf]);
+    const total = entries.reduce((a, e) => a + e.sts.length, 0);
+    if (!total) { setCurrent(null); return; }
+    let r = Math.floor(Math.random() * total);
+    for (const e of entries) {
+      if (r < e.sts.length) { setCurrent(makeScramble(e.id, e.ck, e.sts)); return; }
+      r -= e.sts.length;
+    }
+  }, [selected, caseSel, makeScramble, poolOf]);
 
   const startRecap = useCallback(() => {
     const q = [];
     for (const id of [...selected]) {
       if (!poolOf(id)) continue;
-      for (const ck of poolOf(id).classes.keys()) q.push({ set: id, caseKey: ck });
+      for (const ck of poolOf(id).classes.keys()) { if (caseSel.has(id + "|" + ck)) continue; q.push({ set: id, caseKey: ck }); }
     }
     const queue = shuffled(q);
     setRecap({ queue, idx: 0 });
@@ -806,7 +812,7 @@ export default function L5ETrainer() {
       const it = queue[0];
       setCurrent(makeScramble(it.set, it.caseKey, poolOf(it.set).classes.get(it.caseKey)));
     } else setCurrent(null);
-  }, [selected, makeScramble, poolOf]);
+  }, [selected, caseSel, makeScramble, poolOf]);
 
   // Solution Trainer: every optimal solution (all shortest descents of vdist to a V)
   const allOptimalVs = useCallback((s, vdist) => {
@@ -969,7 +975,7 @@ export default function L5ETrainer() {
     else if (mode === "drill") nextDrill();
     else startRecap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, bar, selected, mode, vlenSel, goals]);
+  }, [ready, bar, selected, mode, vlenSel, goals, caseSel]);
 
   const tick = useCallback(() => {
     setElapsed(performance.now() - t0.current);
@@ -1056,6 +1062,32 @@ export default function L5ETrainer() {
     });
   };
 
+  // Per-case selection. caseSel holds DISABLED cases, so a case is generated
+  // unless it's explicitly turned off (new cases default to on).
+  const ckId = (setId, ck) => setId + "|" + ck;
+  const caseEnabled = (setId, ck) => !caseSel.has(ckId(setId, ck));
+  const toggleCase = (setId, ck) => {
+    setCaseSel((s) => { const n = new Set(s); const k = ckId(setId, ck); if (n.has(k)) n.delete(k); else n.add(k); return n; });
+  };
+  // a set's cases sorted by sheet name
+  const casesOf = useCallback((setId) => {
+    const p = poolOf(setId); if (!p) return [];
+    return [...p.classes.keys()]
+      .map((ck) => ({ ck, name: SHEET.CNAME[ck] || ck }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  }, [poolOf]);
+  const setAllCases = (setId, enable) => {
+    setCaseSel((s) => {
+      const n = new Set(s);
+      for (const { ck } of casesOf(setId)) { const k = ckId(setId, ck); if (enable) n.delete(k); else n.add(k); }
+      return n;
+    });
+  };
+  const enabledCount = useCallback((setId) => {
+    const all = casesOf(setId);
+    return all.length - all.filter(({ ck }) => caseSel.has(ckId(setId, ck))).length;
+  }, [casesOf, caseSel]);
+
   const counts = useMemo(() => {
     if (!ready) return {};
     const c = {};
@@ -1080,7 +1112,7 @@ export default function L5ETrainer() {
     setVfs({});
     setSession([]);
     setLast(null);
-    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], vfs: {}, pso })).catch(() => {}); } catch (e) {}
+    try { window.storage.set(STORE_KEY, JSON.stringify({ caseStats: {}, bar, selected: [...selected], mode, vlen: [...vlenSel], goals: [...goals], caseSel: [...caseSel], vfs: {}, pso })).catch(() => {}); } catch (e) {}
   };
 
   return (
@@ -1123,6 +1155,20 @@ export default function L5ETrainer() {
         .presets { display: flex; gap: 12px; margin: 4px 2px 16px; }
         .preset { background: none; border: none; color: var(--faint); font-size: 12px; cursor: pointer; padding: 0; font-family: inherit; text-decoration: underline dotted; }
         .preset:hover { color: var(--dim); }
+        .setgrp { margin-bottom: 6px; }
+        .setgrp > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; padding: 4px 2px; user-select: none; }
+        .setgrp > summary::-webkit-details-marker { display: none; }
+        .setgrp > summary::before { content: "▸"; color: var(--faint); font-size: 11px; transition: transform .12s; }
+        .setgrp[open] > summary::before { content: "▾"; }
+        .setgrp > summary .ct { color: var(--faint); font-size: 11px; font-family: 'Chivo Mono', monospace; }
+        .casepick { margin: 2px 0 6px; }
+        .casetoggle { display: inline-flex; align-items: center; gap: 8px; background: none; border: none; cursor: pointer;
+          color: var(--dim); font-size: 13px; font-family: inherit; padding: 5px 2px; }
+        .casetoggle:hover { color: var(--text); }
+        .casetoggle .chev { color: var(--faint); font-size: 11px; }
+        .casetoggle .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .casetoggle .ct { color: var(--faint); font-size: 11px; font-family: 'Chivo Mono', monospace; }
+        .caselistwrap { border-left: 2px solid var(--line); padding: 6px 0 6px 12px; margin: 2px 0 8px 6px; }
         .modes { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; margin-bottom: 14px; }
         .mode { padding: 7px 18px; background: var(--panel); border: none; color: var(--dim); cursor: pointer; font-size: 13px; font-family: inherit; }
         .mode.on { background: var(--panel2); color: var(--text); }
@@ -1250,29 +1296,60 @@ export default function L5ETrainer() {
 
         {mode !== "solution" && mode !== "recog" && (
           <>
-            <div className="chips">
-              <span className="grouplabel" style={{ marginLeft: 0 }}>L5E</span>
-              {SETS.filter((s) => s.group === "L5E").map((s) => (
-                <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
-                  style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
-                  <span className="dot" />{s.name}
-                  {ready && <span className="ct">{counts[s.id]}</span>}
-                </button>
-              ))}
-              <span className="grouplabel">L4E</span>
-              {SETS.filter((s) => s.group === "L4E").map((s) => (
-                <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
-                  style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
-                  <span className="dot" />{s.name}
-                  {ready && <span className="ct">{counts[s.id]}</span>}
-                </button>
-              ))}
-            </div>
+            {["L5E", "L4E"].map((grp) => (
+              <details key={grp} className="setgrp" open>
+                <summary>
+                  <span className="grouplabel" style={{ marginLeft: 0 }}>{grp}</span>
+                  <span className="ct">{SETS.filter((s) => s.group === grp && selected.has(s.id)).length} on</span>
+                </summary>
+                <div className="chips" style={{ marginTop: 8 }}>
+                  {SETS.filter((s) => s.group === grp).map((s) => (
+                    <button key={s.id} className={"chip" + (selected.has(s.id) ? " on" : "")}
+                      style={{ "--cdot": s.color }} onClick={() => toggleSet(s.id)}>
+                      <span className="dot" />{s.name}
+                      {ready && <span className="ct">{counts[s.id]}</span>}
+                    </button>
+                  ))}
+                </div>
+              </details>
+            ))}
             <div className="presets">
               <button className="preset" onClick={() => setSelected(new Set(L5E_IDS))}>all L5E</button>
               <button className="preset" onClick={() => setSelected(new Set(ALL_IDS))}>everything</button>
               <button className="preset" onClick={() => setSelected(new Set())}>none</button>
             </div>
+
+            {/* per selected set: choose which individual cases are generated */}
+            {ready && SETS.filter((s) => selected.has(s.id)).map((s) => {
+              const cases = casesOf(s.id);
+              const open = caseBrowser === s.id;
+              return (
+                <div key={s.id} className="casepick">
+                  <button className="casetoggle" onClick={() => setCaseBrowser(open ? null : s.id)}>
+                    <span className="chev">{open ? "▾" : "▸"}</span>
+                    <span className="dot" style={{ background: s.color }} />
+                    {s.name} cases
+                    <span className="ct">{enabledCount(s.id)}/{cases.length}</span>
+                  </button>
+                  {open && (
+                    <div className="caselistwrap">
+                      <div className="presets" style={{ margin: "0 2px 8px" }}>
+                        <button className="preset" onClick={() => setAllCases(s.id, true)}>all</button>
+                        <button className="preset" onClick={() => setAllCases(s.id, false)}>none</button>
+                      </div>
+                      <div className="chips">
+                        {cases.map(({ ck, name }) => (
+                          <button key={ck} className={"chip" + (caseEnabled(s.id, ck) ? " on" : "")}
+                            style={{ "--cdot": s.color }} onClick={() => toggleCase(s.id, ck)}>
+                            <span className="dot" />{name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </>
         )}
 
@@ -1354,7 +1431,8 @@ export default function L5ETrainer() {
                   : vlenSel.size === 0 ? "Select at least one length to start."
                   : "No solutions at the selected lengths for these goals — pick other lengths.")
                 : mode === "recog" ? "Enter at least one valid offset above to start."
-                : "Select at least one set to start."}
+                : selected.size === 0 ? "Select at least one set to start."
+                : "Enable at least one case to start."}
             </div>
           </div>
         ) : current.kind === "recog" ? (
