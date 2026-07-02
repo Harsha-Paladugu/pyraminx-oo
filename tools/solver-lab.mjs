@@ -46,8 +46,7 @@ function buildDist() {
 
 const dist = buildDist();
 const C = makeSolverCore(E, dist);
-const syms = E.buildSyms();
-const rotBy = E.makeFrames(syms);
+const { syms, rotBy } = C;   // built once inside the core
 const rotations = C.buildRotations();
 
 /* ---- defaults straight from solver.js UI ---- */

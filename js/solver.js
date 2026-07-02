@@ -18,7 +18,7 @@ async function boot() {
   rep('Preparing solver\u2026', 0, 1);
   await tick();
   C = CORE.makeSolverCore(E, dist);
-  syms = E.buildSyms(); rotBy = E.makeFrames(syms);
+  syms = C.syms; rotBy = C.rotBy;   // built once inside the core
   rotations = C.buildRotations();
   rep('Ready', 1, 1);
   const bootEl = $('#boot-status');

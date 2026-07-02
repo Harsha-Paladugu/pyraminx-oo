@@ -13,6 +13,10 @@
 function makeSolverCore(E, dist) {
   const MOVES = E.MOVES; // ['U',"U'",'L',"L'",'R',"R'",'B',"B'"]
   const sigOf = s => (E.idx(s) - (E.idx(s) % 3)) / 3; // no-u signature
+  // symmetry tables: built ONCE per core and shared by buildRotations and
+  // ergoScore (and exposed on the API so callers don't rebuild their own)
+  const syms = E.buildSyms();
+  const rotBy = E.makeFrames(syms);
 
   /* ---------- sequence reduction (cancellation) ---------- */
   // tokens: ints 0..7; same corner merges mod 3 with cascade
@@ -116,8 +120,6 @@ function makeSolverCore(E, dist) {
   // For each of the 12 rotations: a token string (<=2 rotation tokens) and the transformed
   // scramble state such that "[tokens] + plain solution of transformed" solves the original.
   function buildRotations() {
-    const syms = E.buildSyms();
-    const rotBy = E.makeFrames(syms);
     const ID = E.symFromFacePerm(E.FACE_ID, false);
     const frameOf = tokens => { // replicate applyParsed's frame tracking for rotation-only strings
       let frame = ID;
@@ -137,12 +139,20 @@ function makeSolverCore(E, dist) {
       const key = JSON.stringify(frameOf(c.toks).fp);
       if (!byKey.has(key)) byKey.set(key, c);
     }
-    // empirically associate each PREFIX with the unique state transform that makes
-    // "[prefix] + plain solution of transformed" verify on the original state
-    const probe = E.solved();
-    for (let i = 0; i < 9; i++) E.applyMoveIdx(probe, Math.floor(Math.random() * 8));
-    const probe2 = E.solved();
-    for (let i = 0; i < 8; i++) E.applyMoveIdx(probe2, Math.floor(Math.random() * 8));
+    // associate each PREFIX with the unique state transform that makes
+    // "[prefix] + plain solution of transformed" verify on the original state.
+    // The probes are FIXED states with trivial rotational stabilizer (asserted:
+    // all 12 rotation images distinct), which makes the association provably
+    // unique — the old random probes could in principle land on a symmetric
+    // state and mis-associate silently.
+    const PROBE_MOVES = [[0, 2, 5, 7, 1, 4, 6, 3, 0], [4, 0, 6, 2, 7, 1, 3, 5]];
+    const [probe, probe2] = PROBE_MOVES.map(ms => {
+      const p = E.solved();
+      for (const m of ms) E.applyMoveIdx(p, m);
+      if (new Set(syms.rots.map(sy => E.idx(E.applySym(sy, p)))).size !== 12)
+        throw new Error('rotation probe is symmetric — choose a different probe scramble');
+      return p;
+    });
     const out = [];
     for (const [, c] of byKey) {
       let chosen = null;
@@ -151,7 +161,7 @@ function makeSolverCore(E, dist) {
         const full = (c.str ? c.str + ' ' : '') + ms;
         const parsed = E.parseAlg(full);
         if (parsed && E.eq(E.applyParsed(parsed, probe, syms, rotBy), E.solved())) {
-          const ms2 = E.optimalSolution(E.applySym(sym, probe2), dist, true);
+          const ms2 = E.optimalSolution(E.applySym(sym, probe2), dist, false);
           if (E.eq(E.applyParsed(E.parseAlg((c.str ? c.str + ' ' : '') + ms2), probe2, syms, rotBy), E.solved())) {
             chosen = { prefix: c.str, sym };
           }
@@ -163,6 +173,8 @@ function makeSolverCore(E, dist) {
     }
     if (out.length !== 12) throw new Error('expected 12 rotation prefixes, got ' + out.length);
     // frames were already deduplicated by byKey above; each surviving prefix maps to one rotation frame.
+    if (new Set(out.map(c => JSON.stringify(c.sym.fp))).size !== 12)
+      throw new Error('rotation association is not a bijection');
     return { rotations: out, syms, rotBy };
   }
 
@@ -177,7 +189,6 @@ function makeSolverCore(E, dist) {
   // tracing the minimal-cost path so the UI can show how each move contributes to the score.
   function ergoScore(seq, rotTokens, w, detail) {
     w = Object.assign({}, ERGO_DEFAULTS, w || {});
-    const { syms, rotBy } = ergoScore._rot || (ergoScore._rot = (() => { const s2 = E.buildSyms(); return { syms: s2, rotBy: E.makeFrames(s2) }; })());
     const ID = E.symFromFacePerm(E.FACE_ID, false);
     const frames = [ID];
     const frameKey = f => JSON.stringify(f.fp);
@@ -302,25 +313,20 @@ function makeSolverCore(E, dist) {
       const junctions = new Map(); // tIdx -> { state, paths: [{seq, hits:[{id,len}]}] }
       const dfs1 = (s, seq, lastCorner) => {
         if (++work > budget) { truncated = true; return; }
-        const sg = sigOf(s);
+        const ix = E.idx(s);                 // hot path: rank once per node
+        const sg = (ix - ix % 3) / 3;        // == sigOf(s), sans the extra idx calls
         // membership hits at this node
         const hits = [];
         for (const id of targets.ids) if (seq.length <= cfg.caps[id] && targets.sets[id].has(sg)) hits.push(id);
         if (hits.length) {
-          const ti = E.idx(s);
-          let j = junctions.get(ti);
-          if (!j) { j = { state: E.copy(s), paths: [] }; junctions.set(ti, j); }
+          let j = junctions.get(ix);
+          if (!j) { j = { state: E.copy(s), paths: [] }; junctions.set(ix, j); }
           j.paths.push({ seq: seq.slice(), hits });
         }
         if (seq.length >= targets.capMax) return;
-        // prune: total budget and target reachability
-        const df = dist[E.idx(s)];
-        if (seq.length + df > Lmax + maxCancel) {
-          // still might reach a target then come back longer? no: executed >= seq.length + dist - cancel
-          // continue only if a target could be hit deeper AND total can still work via slack on A? covered: A <= dist(t)+slack
-          // allow slack margin:
-          if (seq.length + df > Lmax + maxCancel + slack) return;
-        }
+        // prune: executed >= seq.length + dist - cancel, and the finish A may
+        // exceed the case optimum by at most `slack` — beyond that nothing fits.
+        if (seq.length + dist[ix] > Lmax + maxCancel + slack) return;
         for (let m = 0; m < 8; m++) {
           if ((m >> 1) === lastCorner) continue;
           const t = E.copy(s); E.applyMoveIdx(t, m);
@@ -397,7 +403,7 @@ function makeSolverCore(E, dist) {
     return { byLength, dopt, truncated, work };
   }
 
-  return { reduceSeq, pool, compose, invPremoveState, parseOffset, buildTargets, buildRotations, ergoScore, search, METHOD_DEFS, ERGO_DEFAULTS, sigOf };
+  return { reduceSeq, pool, compose, invPremoveState, parseOffset, buildTargets, buildRotations, ergoScore, search, METHOD_DEFS, ERGO_DEFAULTS, sigOf, syms, rotBy };
 }
 if (typeof module !== 'undefined') module.exports = { makeSolverCore };
 window.OOSolverCore=module.exports;})();
